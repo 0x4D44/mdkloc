@@ -4,25 +4,19 @@
 //! providing detailed statistics about code, comment, and blank line distribution.
 //! 
 //! Supported languages: Rust, Go, Python, Java, C/C++, C#, JavaScript, TypeScript, PHP, Perl, Ruby, Shell, Pascal.
-//! 
-//! Key features:
-//! - Recursive directory scanning with configurable depth limits
-//! - Language-specific comment and code recognition
-//! - Detailed per-directory and per-language statistics
-//! - Customisable directory exclusions
-//! - Support for Unicode path normalisation
 
 use std::collections::HashMap;
 use clap::Parser;
 use clap::ArgAction;
 use std::fs;
 use std::env;
-use std::io::{self, BufRead, BufReader};
+use std::io; // Removed unused BufReader
 use std::path::{Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;
 use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::io::Read; // Needed for reading file contents
 
 // Performance metrics structure
 #[derive(Debug)]
@@ -119,26 +113,38 @@ fn normalize_path_str(s: &str) -> String {
     s.nfkc().collect::<String>()
 }
 
-/// Identify the language based on the file extension.
+/// Reads a file’s entire content as lines, converting invalid UTF‑8
+/// sequences using replacement characters.
+fn read_file_lines_lossy(file_path: &Path) -> io::Result<Vec<String>> {
+    let mut file = fs::File::open(file_path)?;
+    let mut content = Vec::new();
+    file.read_to_end(&mut content)?;
+    let content = String::from_utf8_lossy(&content);
+    Ok(content.lines().map(|line| line.to_string()).collect())
+}
+
+/// Identify the language based on the file extension (case-insensitive).
 fn get_language_from_extension(file_name: &str) -> Option<String> {
     let normalized = normalize_path_str(file_name);
-    match normalized.rsplit('.').next() {
-        Some("rs")  => Some("Rust".to_string()),
-        Some("go")  => Some("Go".to_string()),
-        Some("py")  => Some("Python".to_string()),
-        Some("java")=> Some("Java".to_string()),
-        Some("cpp") | Some("c") | Some("h") | Some("hpp") => Some("C/C++".to_string()),
-        Some("cs")  => Some("C#".to_string()),
-        Some("js")  => Some("JavaScript".to_string()),
-        Some("ts")  => Some("TypeScript".to_string()),
-        Some("jsx") => Some("JSX".to_string()),
-        Some("tsx") => Some("TSX".to_string()),
-        Some("php") => Some("PHP".to_string()),
-        Some("pl") | Some("pm") | Some("t") => Some("Perl".to_string()),
-        Some("rb")  => Some("Ruby".to_string()),
-        Some("sh")  => Some("Shell".to_string()),
-        Some("pas") => Some("Pascal".to_string()),
-        _ => None,
+    // Extract extension and convert to lowercase for case-insensitive comparison.
+    let ext = normalized.rsplit('.').next()?.to_lowercase();
+    match ext.as_str() {
+        "rs"   => Some("Rust".to_string()),
+        "go"   => Some("Go".to_string()),
+        "py"   => Some("Python".to_string()),
+        "java" => Some("Java".to_string()),
+        "cpp" | "c" | "h" | "hpp" => Some("C/C++".to_string()),
+        "cs"   => Some("C#".to_string()),
+        "js"   => Some("JavaScript".to_string()),
+        "ts"   => Some("TypeScript".to_string()),
+        "jsx"  => Some("JSX".to_string()),
+        "tsx"  => Some("TSX".to_string()),
+        "php"  => Some("PHP".to_string()),
+        "pl" | "pm" | "t" => Some("Perl".to_string()),
+        "rb"   => Some("Ruby".to_string()),
+        "sh"   => Some("Shell".to_string()),
+        "pas"  => Some("Pascal".to_string()),
+        _      => None,
     }
 }
 
@@ -153,8 +159,13 @@ fn is_ignored_dir(path: &Path) -> bool {
 
 /// Delegate counting to the appropriate parser based on file extension.
 fn count_lines_with_stats(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
-    let extension = file_path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
-    match extension {
+    // Get extension in lowercase for case-insensitive matching.
+    let extension = file_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    match extension.as_str() {
         "rs"  => count_rust_lines(file_path),
         "go"  => count_c_style_lines(file_path),
         "py"  => count_python_lines(file_path),
@@ -170,13 +181,10 @@ fn count_lines_with_stats(file_path: &Path) -> io::Result<(LanguageStats, u64)> 
 }
 
 fn count_generic_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
-    let file = fs::File::open(file_path)?;
-    let reader = BufReader::new(file);
+    let lines = read_file_lines_lossy(file_path)?;
     let mut stats = LanguageStats::default();
-    let mut total_lines = 0u64;
-    for line_result in reader.lines() {
-        total_lines += 1;
-        let line = line_result?;
+    let total_lines = lines.len() as u64;
+    for line in lines {
         if line.trim().is_empty() {
             stats.blank_lines += 1;
         } else {
@@ -187,14 +195,11 @@ fn count_generic_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
 }
 
 fn count_rust_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
-    let file = fs::File::open(file_path)?;
-    let reader = BufReader::new(file);
+    let lines = read_file_lines_lossy(file_path)?;
     let mut stats = LanguageStats::default();
     let mut in_block_comment = false;
-    let mut total_lines = 0u64;
-    for line_result in reader.lines() {
-        let line = line_result?;
-        total_lines += 1;
+    let total_lines = lines.len() as u64;
+    for line in lines {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             stats.blank_lines += 1;
@@ -242,17 +247,14 @@ fn count_rust_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
 }
 
 fn count_python_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
-    let file = fs::File::open(file_path)?;
-    let reader = BufReader::new(file);
+    let lines = read_file_lines_lossy(file_path)?;
     let mut stats = LanguageStats::default();
     let mut in_multiline_string = false;
     let mut multiline_quote_char = '"';
     let mut prev_line_continued = false;
-    let mut total_lines = 0u64;
-    for line_result in reader.lines() {
-        let line = line_result?;
+    let total_lines = lines.len() as u64;
+    for line in lines {
         let trimmed = line.trim();
-        total_lines += 1;
         if trimmed.is_empty() {
             stats.blank_lines += 1;
             continue;
@@ -297,14 +299,11 @@ fn count_python_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
 }
 
 fn count_c_style_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
-    let file = fs::File::open(file_path)?;
-    let reader = BufReader::new(file);
+    let lines = read_file_lines_lossy(file_path)?;
     let mut stats = LanguageStats::default();
     let mut in_block_comment = false;
-    let mut total_lines = 0u64;
-    for line_result in reader.lines() {
-        total_lines += 1;
-        let line = line_result?;
+    let total_lines = lines.len() as u64;
+    for line in lines {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             stats.blank_lines += 1;
@@ -345,15 +344,12 @@ fn count_c_style_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
 }
 
 fn count_javascript_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
-    let file = fs::File::open(file_path)?;
-    let reader = BufReader::new(file);
+    let lines = read_file_lines_lossy(file_path)?;
     let mut stats = LanguageStats::default();
     let mut in_block_comment = false;
     let mut in_jsx_comment = false;
-    let mut total_lines = 0u64;
-    for line_result in reader.lines() {
-        total_lines += 1;
-        let line = line_result?;
+    let total_lines = lines.len() as u64;
+    for line in lines {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             stats.blank_lines += 1;
@@ -425,14 +421,11 @@ fn count_javascript_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> 
 }
 
 fn count_php_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
-    let file = fs::File::open(file_path)?;
-    let reader = BufReader::new(file);
+    let lines = read_file_lines_lossy(file_path)?;
     let mut stats = LanguageStats::default();
     let mut in_block_comment = false;
-    let mut total_lines = 0u64;
-    for line_result in reader.lines() {
-        total_lines += 1;
-        let line = line_result?;
+    let total_lines = lines.len() as u64;
+    for line in lines {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             stats.blank_lines += 1;
@@ -465,14 +458,11 @@ fn count_php_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
 }
 
 fn count_perl_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
-    let file = fs::File::open(file_path)?;
-    let reader = BufReader::new(file);
+    let lines = read_file_lines_lossy(file_path)?;
     let mut stats = LanguageStats::default();
     let mut in_pod_comment = false;
-    let mut total_lines = 0u64;
-    for line_result in reader.lines() {
-        total_lines += 1;
-        let line = line_result?;
+    let total_lines = lines.len() as u64;
+    for line in lines {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             stats.blank_lines += 1;
@@ -503,14 +493,13 @@ fn count_perl_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
 
 /// Ruby: supports line comments (with a special case for shebang) and block comments delimited by "=begin" and "=end".
 fn count_ruby_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
-    let file = fs::File::open(file_path)?;
-    let reader = BufReader::new(file);
+    let lines = read_file_lines_lossy(file_path)?;
     let mut stats = LanguageStats::default();
     let mut in_block_comment = false;
-    let mut total_lines = 0u64;
-    for line_result in reader.lines() {
-        let line = line_result?;
-        total_lines += 1;
+    let total_lines = lines.len() as u64;
+    let mut line_number = 0;
+    for line in lines {
+        line_number += 1;
         let trimmed = line.trim();
         if trimmed.is_empty() {
             stats.blank_lines += 1;
@@ -529,7 +518,7 @@ fn count_ruby_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
             continue;
         }
         if trimmed.starts_with("#") {
-            if total_lines == 1 && trimmed.starts_with("#!") {
+            if line_number == 1 && trimmed.starts_with("#!") {
                 stats.code_lines += 1;
             } else {
                 stats.comment_lines += 1;
@@ -543,20 +532,19 @@ fn count_ruby_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
 
 /// Shell: supports line comments (with a special case for shebang).
 fn count_shell_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
-    let file = fs::File::open(file_path)?;
-    let reader = BufReader::new(file);
+    let lines = read_file_lines_lossy(file_path)?;
     let mut stats = LanguageStats::default();
-    let mut total_lines = 0u64;
-    for line_result in reader.lines() {
-        let line = line_result?;
-        total_lines += 1;
+    let total_lines = lines.len() as u64;
+    let mut line_number = 0;
+    for line in lines {
+        line_number += 1;
         let trimmed = line.trim();
         if trimmed.is_empty() {
             stats.blank_lines += 1;
             continue;
         }
         if trimmed.starts_with("#") {
-            if total_lines == 1 && trimmed.starts_with("#!") {
+            if line_number == 1 && trimmed.starts_with("#!") {
                 stats.code_lines += 1;
             } else {
                 stats.comment_lines += 1;
@@ -570,14 +558,11 @@ fn count_shell_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
 
 /// Pascal: supports line comments ("//") and block comments delimited by "{" and "}" or "(*" and "*)".
 fn count_pascal_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
-    let file = fs::File::open(file_path)?;
-    let reader = BufReader::new(file);
+    let lines = read_file_lines_lossy(file_path)?;
     let mut stats = LanguageStats::default();
-    let mut total_lines = 0u64;
+    let total_lines = lines.len() as u64;
     let mut in_block_comment: Option<String> = None;
-    for line_result in reader.lines() {
-        let line = line_result?;
-        total_lines += 1;
+    for line in lines {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             stats.blank_lines += 1;
@@ -914,6 +899,34 @@ mod tests {
         let (stats, _total_lines) = count_pascal_lines(&temp_dir.path().join("test.pas"))?;
         assert_eq!(stats.code_lines, 3);
         assert_eq!(stats.comment_lines, 4);
+        Ok(())
+    }
+
+    // --- New Tests ---
+
+    #[test]
+    fn test_case_insensitive_extension() {
+        // Test that uppercase or mixed-case extensions are correctly recognised.
+        assert_eq!(get_language_from_extension("TEST.RS"), Some("Rust".to_string()));
+        assert_eq!(get_language_from_extension("example.Js"), Some("JavaScript".to_string()));
+        assert_eq!(get_language_from_extension("module.Py"), Some("Python".to_string()));
+        assert_eq!(get_language_from_extension("FOO.TS"), Some("TypeScript".to_string()));
+    }
+
+    #[test]
+    fn test_invalid_utf8_handling() -> io::Result<()> {
+        // Create a file with invalid UTF-8 bytes.
+        let temp_dir = TempDir::new()?;
+        let file_path = temp_dir.path().join("invalid.txt");
+        // Write valid UTF-8 text, then an invalid byte (0xFF), then more valid text.
+        fs::write(&file_path, b"hello\n\xFFworld\n")?;
+        // read_file_lines_lossy should not error and should replace the invalid byte.
+        let lines = read_file_lines_lossy(&file_path)?;
+        // Expect two lines: "hello" and "�world"
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "hello");
+        // The invalid byte is replaced with the Unicode replacement character.
+        assert!(lines[1].contains("�world"));
         Ok(())
     }
 }
