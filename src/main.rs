@@ -10,13 +10,16 @@ use clap::Parser;
 use clap::ArgAction;
 use std::fs;
 use std::env;
-use std::io; // Removed unused BufReader
+use std::io; // No BufReader here.
 use std::path::{Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;
 use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::io::Read; // Needed for reading file contents
+
+// Fixed width for the directory column.
+const DIR_WIDTH: usize = 40;
 
 // Performance metrics structure
 #[derive(Debug)]
@@ -113,8 +116,7 @@ fn normalize_path_str(s: &str) -> String {
     s.nfkc().collect::<String>()
 }
 
-/// Reads a file’s entire content as lines, converting invalid UTF‑8
-/// sequences using replacement characters.
+/// Reads a file’s entire content as lines, converting invalid UTF‑8 sequences using replacement characters.
 fn read_file_lines_lossy(file_path: &Path) -> io::Result<Vec<String>> {
     let mut file = fs::File::open(file_path)?;
     let mut content = Vec::new();
@@ -155,6 +157,19 @@ fn is_ignored_dir(path: &Path) -> bool {
         "venv", "__pycache__", "bin", "obj"
     ];
     ignored.contains(&dir_name)
+}
+
+/// Helper function that truncates the given string to a maximum number of characters by keeping the last characters.
+/// If truncation occurs, the returned string is prefixed with "..." so that its total length equals max_len.
+fn truncate_start(s: &str, max_len: usize) -> String {
+    let char_count = s.chars().count();
+    if char_count <= max_len {
+        s.to_string()
+    } else {
+        // Take the last (max_len - 3) characters and prefix with "..."
+        let truncated: String = s.chars().rev().take(max_len - 3).collect::<Vec<_>>().into_iter().rev().collect();
+        format!("...{}", truncated)
+    }
 }
 
 /// Delegate counting to the appropriate parser based on file extension.
@@ -726,6 +741,8 @@ fn main() -> io::Result<()> {
     println!("Starting source code analysis...");
     let stats = scan_directory(path, &args, &current_dir, &mut metrics)?;
     metrics.print_final_stats();
+    
+    // Print detailed analysis with fixed-width directory field.
     let mut total_by_language: HashMap<String, (u64, LanguageStats)> = HashMap::new();
     let mut sorted_stats: Vec<_> = stats.iter().collect();
     sorted_stats.sort_by(|(a, _), (b, _)| a.to_string_lossy().cmp(&b.to_string_lossy()));
@@ -734,11 +751,13 @@ fn main() -> io::Result<()> {
     println!("{:<40} {:<12} {:>8} {:>10} {:>10} {:>10}", "Directory", "Language", "Files", "Code", "Comments", "Blank");
     println!("{:-<100}", "");
     for (path, dir_stats) in &sorted_stats {
-        let display_path = match path.strip_prefix(&current_dir) {
+        let raw_display = match path.strip_prefix(&current_dir) {
             Ok(p) if p.as_os_str().is_empty() => String::from("."),
             Ok(p) => p.to_string_lossy().to_string(),
             Err(_) => path.to_string_lossy().to_string(),
         };
+        // Truncate the directory name from the start if it is too long.
+        let display_path = truncate_start(&raw_display, DIR_WIDTH);
         let mut languages: Vec<_> = dir_stats.language_stats.iter().collect();
         languages.sort_by(|(a, _), (b, _)| a.cmp(b));
         for (lang, (file_count, lang_stats)) in &languages {
@@ -906,7 +925,7 @@ mod tests {
 
     #[test]
     fn test_case_insensitive_extension() {
-        // Test that uppercase or mixed-case extensions are correctly recognised.
+        // Test that uppercase or mixed-case extensions are correctly recognized.
         assert_eq!(get_language_from_extension("TEST.RS"), Some("Rust".to_string()));
         assert_eq!(get_language_from_extension("example.Js"), Some("JavaScript".to_string()));
         assert_eq!(get_language_from_extension("module.Py"), Some("Python".to_string()));
@@ -928,5 +947,19 @@ mod tests {
         // The invalid byte is replaced with the Unicode replacement character.
         assert!(lines[1].contains("�world"));
         Ok(())
+    }
+
+    #[test]
+    fn test_truncate_start() {
+        // When the string is short, it remains unchanged.
+        assert_eq!(truncate_start("short", DIR_WIDTH), "short");
+        // When too long, it should be truncated from the start.
+        let long_str = "winmerge-master\\Externals\\boost\\boost\\config\\compiler";
+        let truncated = truncate_start(long_str, DIR_WIDTH);
+        assert_eq!(truncated.chars().count(), DIR_WIDTH);
+        assert!(truncated.starts_with("..."));
+        // The truncated version should contain the important ending portion.
+        let expected_ending: String = long_str.chars().rev().take(DIR_WIDTH - 3).collect::<Vec<_>>().into_iter().rev().collect();
+        assert!(truncated.ends_with(&expected_ending));
     }
 }
