@@ -1,42 +1,166 @@
-# Source Code Analysis Tool
+# mdkloc
 
-A fast and versatile command-line tool for analyzing source code across multiple programming languages. It computes detailed statistics on code lines, comment lines, and blank lines, providing a clear picture of the structure and documentation quality of your projects.
-
----
-
-## Overview
-
-The **Source Code Analysis Tool** is designed to help developers understand the composition of their codebases. Whether you’re looking to enforce coding standards, improve documentation, or simply gain insights into your project's structure, this tool offers:
-
-- **Multi-language support:** Analyze files written in Rust, Go, Python, Java, C/C++, C#, JavaScript, TypeScript, PHP, Perl, Ruby, Shell, and Pascal.
-- **Detailed statistics:** Get counts of code lines, comment lines, and blank lines for each file and directory.
-- **Real-time performance metrics:** Track files and lines processed with progress updates.
-- **Customizable scanning:** Ignore specified directories, control verbosity, and limit the number of entries scanned.
-
----
+A high-performance, multi-language source code analyzer written in Rust that provides detailed statistics about code, comment, and blank line distribution across your codebase.
 
 ## Features
 
-- **Language Detection:** Automatically identifies the programming language based on file extension (case-insensitive).
-- **Line Counting Strategies:** Implements specialized parsers for different languages to correctly identify code, comments, and blank lines.
-- **Performance Metrics:** Displays real-time updates on files and lines processed, including throughput statistics.
-- **Directory Scanning:** Recursively scans directories with built-in support to ignore common build and dependency folders (e.g., `node_modules`, `target`, `.git`, etc.).
-- **Verbose Mode:** Optionally print detailed file-level analysis during the scan.
-- **Unicode Handling:** Normalizes file paths using Unicode NFKC and safely reads file contents with invalid UTF‑8 sequences.
+- **Multi-Language Support**: Analyzes source code in multiple programming languages, including:
+  - Systems: Rust, Go, C/C++
+  - JVM: Java
+  - .NET: C#
+  - Web: JavaScript, TypeScript, JSX, TSX, PHP
+  - Scripting: Python, Perl, Ruby, Shell
+  - Others: Pascal
 
----
+- **Comprehensive Analysis**: Provides detailed statistics for each file and directory:
+  - Code lines count
+  - Comment lines count (including support for language-specific comment styles)
+  - Blank lines count
+  - Per-language and overall metrics
+
+- **Performance Features**:
+  - Parallel processing capabilities
+  - Real-time progress tracking
+  - Performance metrics reporting
+  - Configurable entry limits for large directories
+
+- **Smart Detection**:
+  - Automatic language detection based on file extensions
+  - Support for multiple comment styles (line, block, documentation)
+  - Unicode normalization for path handling
+  - Case-insensitive file extension matching
 
 ## Installation
 
-### Prerequisites
-
-- **Rust Toolchain:** Ensure you have the [Rust toolchain](https://www.rust-lang.org/tools/install) installed on your machine.
-
-### Building from Source
-
-Clone the repository and build the project using Cargo:
+To install the tool, you'll need Rust installed on your system. Then run:
 
 ```bash
-git clone https://github.com/yourusername/source-code-analysis-tool.git
-cd source-code-analysis-tool
+cargo install source-code-analyzer  # Replace with actual crate name
+```
+
+Or build from source:
+
+```bash
+git clone <repository-url>
+cd source-code-analyzer
 cargo build --release
+```
+
+## Usage
+
+Basic usage:
+
+```bash
+source-code-analyzer [PATH]
+```
+
+### Command Line Options
+
+- `[PATH]`: Directory to analyze (defaults to current directory)
+- `-i, --ignore <PATHS>`: Directories to ignore (can be specified multiple times)
+- `-v, --verbose`: Enable verbose output with per-file statistics
+- `-m, --max-entries <NUMBER>`: Maximum number of entries to process (default: 1000000)
+
+### Examples
+
+Analyze current directory:
+```bash
+source-code-analyzer
+```
+
+Analyze specific directory with ignored paths:
+```bash
+source-code-analyzer /path/to/project --ignore node_modules --ignore target
+```
+
+Enable verbose output:
+```bash
+source-code-analyzer --verbose
+```
+
+## Output Format
+
+The tool provides three levels of output:
+
+1. **Progress Updates** (during processing):
+   ```
+   Processed 150 files (75.0 files/sec) and 45000 lines (22500.0 lines/sec)...
+   ```
+
+2. **Detailed Analysis** (per directory):
+   ```
+   Directory                                 Language     Files      Code  Comments     Blank
+   -------------------------------------------------------------------------------
+   ./src                                    Rust            10      1500       300       200
+   ./tests                                  Rust             5       800       150       100
+   ```
+
+3. **Summary Statistics**:
+   ```
+   Overall Summary:
+   Total files processed: 15
+   Total lines processed: 3050
+   Code lines:     2300 (75.4%)
+   Comment lines:  450 (14.8%)
+   Blank lines:    300 (9.8%)
+   ```
+
+## Features by Language
+
+| Language    | Line Comments | Block Comments | Doc Comments | Special Features |
+|------------|---------------|----------------|--------------|------------------|
+| Rust       | //           | /* */         | /// //!      | Attribute support |
+| Python     | #            | ''' '''       | -            | Multi-line strings |
+| JavaScript | //           | /* */ <!--    | -            | JSX comments |
+| Ruby       | #            | =begin/=end   | -            | Shebang support |
+| Pascal     | //           | { } (* *)     | -            | Multiple block styles |
+
+## Auto-Ignored Directories
+
+The following directories are automatically ignored:
+- `target`
+- `node_modules`
+- `build`
+- `dist`
+- `.git`
+- `venv`
+- `__pycache__`
+- `bin`
+- `obj`
+
+## Performance Considerations
+
+- Uses efficient file reading with UTF-8 validation
+- Handles invalid UTF-8 sequences gracefully
+- Implements parallel processing for large codebases
+- Provides real-time progress updates
+- Configurable limits to prevent resource exhaustion
+
+## Contributing
+
+Contributions are welcome! Areas for potential improvement:
+
+- Additional language support
+- Enhanced comment detection algorithms
+- Performance optimizations
+- Additional metrics and analysis features
+- Test coverage expansion
+
+## Testing
+
+Run the test suite:
+
+```bash
+cargo test
+```
+
+The project includes comprehensive tests covering:
+- Directory scanning
+- Line counting for each supported language
+- UTF-8 handling
+- Path truncation
+- Extension recognition
+
+## License
+
+[Add your license information here]
