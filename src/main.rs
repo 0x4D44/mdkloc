@@ -950,6 +950,22 @@ mod tests {
     }
 
     #[test]
+    fn test_generic_line_counting() -> io::Result<()> {
+        // Create a file with an unknown extension containing blank and code lines.
+        let temp_dir = TempDir::new()?;
+        // Mix of code lines and blank lines
+        let content = "first line\n\nsecond line\n   \nthird line\n";
+        create_test_file(&temp_dir.path(), "file.xyz", content)?;
+
+        let (stats, _total_lines) = count_generic_lines(&temp_dir.path().join("file.xyz"))?;
+        assert_eq!(stats.code_lines, 3);
+        assert_eq!(stats.blank_lines, 2);
+        // Generic counting does not track comment lines
+        assert_eq!(stats.comment_lines, 0);
+        Ok(())
+    }
+
+    #[test]
     fn test_truncate_start() {
         // When the string is short, it remains unchanged.
         assert_eq!(truncate_start("short", DIR_WIDTH), "short");
