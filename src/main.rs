@@ -451,7 +451,11 @@ fn count_php_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
             if trimmed.contains("*/") {
                 in_block_comment = false;
                 if let Some(code) = trimmed.split("*/").nth(1) {
-                    if !code.trim().is_empty() && !code.trim_start().starts_with(|c| c == '/' || c == '#') {
+                    let code_trimmed = code.trim_start();
+                    if !code_trimmed.is_empty()
+                        && !code_trimmed.starts_with("//")
+                        && !code_trimmed.starts_with('#')
+                    {
                         stats.code_lines += 1;
                     }
                 }
