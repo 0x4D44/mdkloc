@@ -6,17 +6,18 @@
 //! Supported languages: Rust, Go, Python, Java, C/C++, C#, JavaScript, TypeScript, PHP, Perl, Ruby, Shell, Pascal.
 
 use std::collections::HashMap;
-use clap::Parser;
-use clap::ArgAction;
+use clap::{Parser, ArgAction};
 use std::fs;
 use std::env;
 use std::io; // No BufReader here.
 use std::path::{Path, PathBuf};
-use unicode_normalization::UnicodeNormalization;
+
 use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::io::Read; // Needed for reading file contents
+use glob::glob;
+use colored::*;
 
 // Fixed width for the directory column.
 const DIR_WIDTH: usize = 40;
@@ -34,8 +35,8 @@ struct PerformanceMetrics {
 #[command(
     author,
     version,
-    about = "Source code analyser for multiple programming languages",
-    long_about = "Supported languages: Rust, Go, Python, Java, C/C++, C#, JavaScript, TypeScript, PHP, Perl, Ruby, Shell, Pascal."
+    about = "Source code analyser for multiple programming languages. Supported languages: Rust, Go, Python, Java, C/C++, C#, JavaScript, TypeScript, PHP, Perl, Ruby, Shell, Pascal.",
+    color = clap::ColorChoice::Always
 )]
 struct Args {
     #[arg(default_value = ".")]
@@ -52,6 +53,12 @@ struct Args {
     
     #[arg(short = 'd', long, default_value = "100")]
     max_depth: usize,
+
+    #[arg(long)]
+    non_recursive: bool,
+
+    #[arg(long)]
+    filespec: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -107,17 +114,14 @@ impl PerformanceMetrics {
         let files = self.files_processed.load(Ordering::Relaxed);
         let lines = self.lines_processed.load(Ordering::Relaxed);
         
-        println!("\n\nPerformance Summary:");
-        println!("Total time: {:.2} seconds", elapsed);
-        println!("Files processed: {} ({:.1} files/sec)", files, files as f64 / elapsed);
-        println!("Lines processed: {} ({:.1} lines/sec)", lines, lines as f64 / elapsed);
+        println!("\n\n{}", "Performance Summary:".blue().bold());
+        println!("Total time: {:.2} seconds", elapsed.to_string().bright_yellow());
+        println!("Files processed: {} ({:.1} files/sec)", files.to_string().bright_yellow(), (files as f64 / elapsed).to_string().bright_yellow());
+        println!("Lines processed: {} ({:.1} lines/sec)", lines.to_string().bright_yellow(), (lines as f64 / elapsed).to_string().bright_yellow());
     }
 }
 
-/// Normalise a path string using Unicode NFKC.
-fn normalize_path_str(s: &str) -> String {
-    s.nfkc().collect::<String>()
-}
+
 
 /// Reads a file’s entire content as lines, converting invalid UTF‑8 sequences using replacement characters.
 fn read_file_lines_lossy(file_path: &Path) -> io::Result<Vec<String>> {
@@ -720,10 +724,13 @@ fn scan_directory(
         return Ok(HashMap::new());
     }
 
+    if args.non_recursive && current_depth > 0 {
+        return Ok(HashMap::new());
+    }
+
     // Dynamically size HashMap based on expected entries
     let estimate_size = if path.is_dir() { 128 } else { 1 };
     let mut stats: HashMap<PathBuf, DirectoryStats> = HashMap::with_capacity(estimate_size);
-    let mut total_entries = 0;
     
     if is_ignored_dir(path) || args.ignore.iter().any(|d| path.ends_with(Path::new(d))) {
         return Ok(stats);
@@ -756,76 +763,113 @@ fn scan_directory(
         }
         return Ok(stats);
     }
-    
-    let read_dir = fs::read_dir(path)?;
-    for entry_result in read_dir {
-        let entry = match entry_result {
-            Ok(entry) => entry,
-            Err(e) => {
-                eprintln!("Error reading entry in {}: {}", path.display(), e);
-                *error_count += 1;
-                continue;
-            }
-        };
-        
-        total_entries += 1;
-        if total_entries > args.max_entries {
-            *error_count += 1;
-            return Err(io::Error::new(io::ErrorKind::Other, "Too many entries in directory tree"));
-        }
-        
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() && !file_type.is_symlink() {
-            match scan_directory(&entry.path(), args, current_dir, metrics, current_depth + 1, error_count) {
-                Ok(sub_stats) => {
-                    for (path, stat) in sub_stats {
-                        if let Some(existing) = stats.get_mut(&path) {
-                            for (lang, (count, lang_stats)) in stat.language_stats {
-                                let (existing_count, existing_stats) = existing.language_stats.entry(lang).or_insert((0, LanguageStats::default()));
-                                *existing_count += count;
-                                existing_stats.code_lines += lang_stats.code_lines;
-                                existing_stats.comment_lines += lang_stats.comment_lines;
-                                existing_stats.blank_lines += lang_stats.blank_lines;
+
+    if let Some(filespec) = &args.filespec {
+        let pattern = path.join(filespec);
+        for entry in glob(pattern.to_str().unwrap()).expect("Failed to read glob pattern ") {
+            match entry {
+                Ok(path) => {
+                    if path.is_file() {
+                        if let Some(language) = path.file_name().and_then(|n| n.to_str()).and_then(get_language_from_extension) {
+                            let dir_path = match path.parent() {
+                                Some(parent) => parent.to_path_buf(),
+                                None => PathBuf::from(""),
+                            };
+                            
+                            match count_lines_with_stats(&path) {
+                                Ok((ref file_stats, total_lines)) => {
+                                    metrics.update(total_lines);
+                                    let dir_stats = stats.entry(dir_path).or_default();
+                                    let (count, lang_stats) = dir_stats.language_stats.entry(language.to_string()).or_insert((0, LanguageStats::default()));
+                                    *count += 1;
+                                    lang_stats.code_lines += file_stats.code_lines;
+                                    lang_stats.comment_lines += file_stats.comment_lines;
+                                    lang_stats.blank_lines += file_stats.blank_lines;
+                                    if args.verbose {
+                                        println!("File: {}", path.display());
+                                        println!("  Code lines: {}", file_stats.code_lines);
+                                        println!("  Comment lines: {}", file_stats.comment_lines);
+                                        println!("  Blank lines: {}", file_stats.blank_lines);
+                                        println!();
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("Error counting lines in {}: {}", path.display(), e);
+                                    *error_count += 1;
+                                }
                             }
-                        } else {
-                            stats.insert(path, stat);
                         }
                     }
                 }
-                Err(e) => {
-                    eprintln!("Error scanning directory {}: {}", entry.path().display(), e);
-                    *error_count += 1;
-                }
+                Err(e) => println!("{:?}", e),
             }
-        } else if file_type.is_file() && !file_type.is_symlink() {
-            let file_name = entry.file_name().to_string_lossy().to_string();
-            if let Some(language) = get_language_from_extension(&file_name) {
-                // Safely handle parent path without unwrapping
-                let dir_path = match entry.path().parent() {
-                    Some(parent) => parent.to_path_buf(),
-                    None => PathBuf::from(""),
-                };
-                
-                match count_lines_with_stats(&entry.path()) {
-                    Ok((ref file_stats, total_lines)) => {
-                        metrics.update(total_lines);
-                        let dir_stats = stats.entry(dir_path).or_default();
-                        let (count, lang_stats) = dir_stats.language_stats.entry(language.to_string()).or_insert((0, LanguageStats::default()));
-                        *count += 1;
-                        lang_stats.code_lines += file_stats.code_lines;
-                        lang_stats.comment_lines += file_stats.comment_lines;
-                        lang_stats.blank_lines += file_stats.blank_lines;
-                        if args.verbose {
-                            println!("File: {}", entry.path().display());
-                            println!("  Code lines: {}", file_stats.code_lines);
-                            println!("  Comment lines: {}", file_stats.comment_lines);
-                            println!("  Blank lines: {}", file_stats.blank_lines);
-                            println!();
+        }
+    } else {
+        let read_dir = fs::read_dir(path)?;
+        for entry_result in read_dir {
+            let entry = match entry_result {
+                Ok(entry) => entry,
+                Err(e) => {
+                    eprintln!("Error reading entry in {}: {}", path.display(), e);
+                    *error_count += 1;
+                    continue;
+                }
+            };
+            
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() && !file_type.is_symlink() {
+                if !args.non_recursive {
+                    match scan_directory(&entry.path(), args, current_dir, metrics, current_depth + 1, error_count) {
+                        Ok(sub_stats) => {
+                            for (path, stat) in sub_stats {
+                                if let Some(existing) = stats.get_mut(&path) {
+                                    for (lang, (count, lang_stats)) in stat.language_stats {
+                                        let (existing_count, existing_stats) = existing.language_stats.entry(lang).or_insert((0, LanguageStats::default()));
+                                        *existing_count += count;
+                                        existing_stats.code_lines += lang_stats.code_lines;
+                                        existing_stats.comment_lines += lang_stats.comment_lines;
+                                        existing_stats.blank_lines += lang_stats.blank_lines;
+                                    }
+                                } else {
+                                    stats.insert(path, stat);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Error scanning directory {}: {}", entry.path().display(), e);
+                            *error_count += 1;
                         }
                     }
-                    Err(e) => {
-                        eprintln!("Error counting lines in {}: {}", entry.path().display(), e);
-                        *error_count += 1;
+                }
+            } else if file_type.is_file() && !file_type.is_symlink() {
+                let file_name = entry.file_name().to_string_lossy().to_string();
+                if let Some(language) = get_language_from_extension(&file_name) {
+                    let dir_path = match entry.path().parent() {
+                        Some(parent) => parent.to_path_buf(),
+                        None => PathBuf::from(""),
+                    };
+                    
+                    match count_lines_with_stats(&entry.path()) {
+                        Ok((ref file_stats, total_lines)) => {
+                            metrics.update(total_lines);
+                            let dir_stats = stats.entry(dir_path).or_default();
+                            let (count, lang_stats) = dir_stats.language_stats.entry(language.to_string()).or_insert((0, LanguageStats::default()));
+                            *count += 1;
+                            lang_stats.code_lines += file_stats.code_lines;
+                            lang_stats.comment_lines += file_stats.comment_lines;
+                            lang_stats.blank_lines += file_stats.blank_lines;
+                            if args.verbose {
+                                println!("File: {}", entry.path().display());
+                                println!("  Code lines: {}", file_stats.code_lines);
+                                println!("  Comment lines: {}", file_stats.comment_lines);
+                                println!("  Blank lines: {}", file_stats.blank_lines);
+                                println!();
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Error counting lines in {}: {}", entry.path().display(), e);
+                            *error_count += 1;
+                        }
                     }
                 }
             }
@@ -838,7 +882,7 @@ fn scan_directory(
 /// Helper function to print stats for a language
 fn print_language_stats(prefix: &str, lang: &str, file_count: u64, stats: &LanguageStats) {
     println!("{:<40} {:<12} {:>8} {:>10} {:>10} {:>10}", 
-        prefix, lang, file_count, stats.code_lines, stats.comment_lines, stats.blank_lines);
+        prefix.white(), lang.white(), file_count.to_string().bright_yellow(), stats.code_lines.to_string().bright_yellow(), stats.comment_lines.to_string().bright_yellow(), stats.blank_lines.to_string().bright_yellow());
 }
 
 fn main() -> io::Result<()> {
@@ -862,10 +906,18 @@ fn main() -> io::Result<()> {
     let mut sorted_stats: Vec<_> = stats.iter().collect();
     sorted_stats.sort_by(|(a, _), (b, _)| a.to_string_lossy().cmp(&b.to_string_lossy()));
     
-    println!("\nDetailed source code analysis:");
-    println!("{:-<100}", "");
-    println!("{:<40} {:<12} {:>8} {:>10} {:>10} {:>10}", "Directory", "Language", "Files", "Code", "Comments", "Blank");
-    println!("{:-<100}", "");
+    println!("\n\n{}", "Detailed source code analysis:".blue().bold());
+    println!("{}", "-".repeat(100).truecolor(100, 100, 100));
+    let dir_header = "Directory".white().bold();
+    let lang_header = "Language".white().bold();
+    let files_header = "Files".white().bold();
+    let code_header = "Code".white().bold();
+    let comments_header = "Comments".white().bold();
+    let blank_header = "Blank".white().bold();
+
+    println!("{:<40} {:<12} {:>8} {:>10} {:>10} {:>10}",
+        dir_header, lang_header, files_header, code_header, comments_header, blank_header);
+    println!("{}", "-".repeat(100).truecolor(100, 100, 100));
     
     for (path, dir_stats) in &sorted_stats {
         // Use a reference to avoid unnecessary string cloning
@@ -892,8 +944,8 @@ fn main() -> io::Result<()> {
         }
     }
     
-    println!("{:-<100}", "");
-    println!("Totals by language:");
+    println!("{:-<100}", "".truecolor(100, 100, 100));
+    println!("{}", "Totals by language:".blue().bold());
     
     let mut sorted_totals: Vec<_> = total_by_language.iter().collect();
     sorted_totals.sort_by(|(a, _), (b, _)| a.cmp(b));
@@ -915,15 +967,15 @@ fn main() -> io::Result<()> {
     let total_lines = grand_total.code_lines + grand_total.comment_lines + grand_total.blank_lines;
     
     if total_lines > 0 {
-        println!("\nOverall Summary:");
-        println!("Total files processed: {}", total_files);
-        println!("Total lines processed: {}", total_lines);
-        println!("Code lines:     {} ({:.1}%)", grand_total.code_lines, (grand_total.code_lines as f64 / total_lines as f64) * 100.0);
-        println!("Comment lines:  {} ({:.1}%)", grand_total.comment_lines, (grand_total.comment_lines as f64 / total_lines as f64) * 100.0);
-        println!("Blank lines:    {} ({:.1}%)", grand_total.blank_lines, (grand_total.blank_lines as f64 / total_lines as f64) * 100.0);
+        println!("\n{}", "Overall Summary:".blue().bold());
+        println!("Total files processed: {}", total_files.to_string().bright_yellow());
+        println!("Total lines processed: {}", total_lines.to_string().bright_yellow());
+        println!("Code lines:     {} ({:.1}%)", grand_total.code_lines.to_string().bright_yellow(), ((grand_total.code_lines as f64 / total_lines as f64) * 100.0).to_string().bright_yellow());
+        println!("Comment lines:  {} ({:.1}%)", grand_total.comment_lines.to_string().bright_yellow(), ((grand_total.comment_lines as f64 / total_lines as f64) * 100.0).to_string().bright_yellow());
+        println!("Blank lines:    {} ({:.1}%)", grand_total.blank_lines.to_string().bright_yellow(), ((grand_total.blank_lines as f64 / total_lines as f64) * 100.0).to_string().bright_yellow());
         
         if error_count > 0 {
-            println!("\nWarning: Encountered {} errors during processing.", error_count);
+            println!("\n{}: {}", "Warning".red().bold(), error_count.to_string().bright_yellow());
         }
     }
     
@@ -944,6 +996,8 @@ mod tests {
             verbose: false,
             max_entries: 1000000,
             max_depth: 100,
+            non_recursive: false,
+            filespec: None,
         }
     }
 
