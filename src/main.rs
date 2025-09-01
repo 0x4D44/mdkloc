@@ -156,6 +156,7 @@ fn get_language_from_extension(file_name: &str) -> Option<&'static str> {
         "rb"   => Some("Ruby"),
         "sh"   => Some("Shell"),
         "pas"  => Some("Pascal"),
+        "toml" => Some("TOML"),
         _      => None,
     }
 }
@@ -203,6 +204,7 @@ fn count_lines_with_stats(file_path: &Path) -> io::Result<(LanguageStats, u64)> 
         "rb"  => count_ruby_lines(file_path),
         "sh"  => count_shell_lines(file_path),
         "pas" => count_pascal_lines(file_path),
+        "toml" => count_toml_lines(file_path),
         _     => count_generic_lines(file_path),
     }
 }
@@ -706,6 +708,27 @@ fn count_pascal_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
     
     Ok((stats, total_lines))
 }
+
+/// TOML: supports line comments with '#'.
+fn count_toml_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
+    let lines = read_file_lines_lossy(file_path)?;
+    let mut stats = LanguageStats::default();
+    let total_lines = lines.len() as u64;
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            stats.blank_lines += 1;
+            continue;
+        }
+        if trimmed.starts_with("#") {
+            stats.comment_lines += 1;
+            continue;
+        }
+        stats.code_lines += 1;
+    }
+    Ok((stats, total_lines))
+}
+
 
 /// Recursively scan directories and collect statistics.
 /// Added error tracking and directory depth limiting to prevent stack overflow.
