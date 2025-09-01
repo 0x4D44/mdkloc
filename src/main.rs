@@ -54,10 +54,10 @@ struct Args {
     #[arg(short = 'd', long, default_value = "100")]
     max_depth: usize,
 
-    #[arg(long)]
+    #[arg(short = 'n', long)]
     non_recursive: bool,
 
-    #[arg(long)]
+    #[arg(short = 'f', long)]
     filespec: Option<String>,
 }
 
