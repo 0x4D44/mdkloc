@@ -963,6 +963,11 @@ fn print_language_stats(prefix: &str, lang: &str, file_count: u64, stats: &Langu
 }
 
 fn main() -> io::Result<()> {
+    println!(
+        "{} {}",
+        env!("CARGO_PKG_NAME").bright_cyan().bold(),
+        format!("v{}", env!("CARGO_PKG_VERSION")).bright_yellow()
+    );
     let args = Args::parse();
     let path = Path::new(&args.path);
     let current_dir = env::current_dir()?;
