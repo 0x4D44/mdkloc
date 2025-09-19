@@ -161,6 +161,13 @@ fn get_language_from_extension(file_name: &str) -> Option<&'static str> {
     if lower == "cmakelists.txt" {
         return Some("CMake");
     }
+    // Common shell dotfiles
+    match lower.as_str() {
+        ".bashrc" | ".bash_profile" | ".profile" | ".zshrc" | ".zprofile" | ".zshenv" | ".kshrc" | ".cshrc" => {
+            return Some("Shell");
+        }
+        _ => {}
+    }
 
     // Extract extension if present
     let (stem, ext) = match file_name.rsplit_once('.') {
@@ -223,7 +230,7 @@ fn get_language_from_extension(file_name: &str) -> Option<&'static str> {
         // COBOL and copybooks
         "cob" | "cbl" | "cobol" | "cpy" => Some("COBOL"),
         // Fortran (fixed/free forms)
-        "f" | "for" | "f77" | "f90" | "f95" | "f03" | "f08" | "f18" | "F" | "F90" | "F95" => Some("Fortran"),
+        "f" | "for" | "f77" | "f90" | "f95" | "f03" | "f08" | "f18" => Some("Fortran"),
         // Assembly (x86 et al.)
         "asm" | "s" | "S" => Some("Assembly"),
         // DCL (OpenVMS command procedures)
@@ -312,8 +319,8 @@ fn count_lines_with_stats(file_path: &Path) -> io::Result<(LanguageStats, u64)> 
         // New classic languages
         "alg" | "algol" | "a60" | "a68" => count_algol_lines(file_path),
         "cob" | "cbl" | "cobol" | "cpy" => count_cobol_lines(file_path),
-        "f" | "for" | "f77" | "f90" | "f95" | "f03" | "f08" | "f18" | "f" | "f90" | "f95" => count_fortran_lines(file_path),
-        "asm" | "s" | "s" => count_asm_lines(file_path),
+        "f" | "for" | "f77" | "f90" | "f95" | "f03" | "f08" | "f18" => count_fortran_lines(file_path),
+        "asm" | "s" => count_asm_lines(file_path),
         "com" => count_dcl_lines(file_path),
         "ipl" => count_iplan_lines(file_path),
         _     => count_generic_lines(file_path),
@@ -416,7 +423,7 @@ fn count_python_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
             stats.comment_lines += 1;
             continue;
         }
-        if (trimmed.starts_with("'''") || trimmed.starts_with(r#"""""#)) && !prev_line_continued {
+        if (trimmed.starts_with("'''") || trimmed.starts_with("\"\"\"")) && !prev_line_continued {
             let quote = &trimmed[..3];
             if trimmed.len() >= 6 && trimmed[3..].contains(quote) {
                 stats.comment_lines += 1;
@@ -461,16 +468,20 @@ fn count_c_style_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
             }
             continue;
         }
-        if trimmed.starts_with("/*") {
-            in_block_comment = true;
+        // Handle inline block comments and code around them
+        if let Some(pos) = trimmed.find("/*") {
+            // code before comment
+            let before = &trimmed[..pos];
+            if !before.trim().is_empty() { stats.code_lines += 1; }
             stats.comment_lines += 1;
-            if trimmed.contains("*/") {
-                in_block_comment = false;
-                if let Some(code) = trimmed.split("*/").nth(1) {
-                    if !code.trim().is_empty() {
-                        stats.code_lines += 1;
-                    }
+            // same-line close?
+            if let Some(end) = trimmed[pos..].find("*/") {
+                let after = &trimmed[(pos + end + 2)..];
+                if !after.trim().is_empty() && !after.trim_start().starts_with("//") {
+                    stats.code_lines += 1;
                 }
+            } else {
+                in_block_comment = true;
             }
             continue;
         }
@@ -587,9 +598,21 @@ fn count_php_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
             }
             continue;
         }
-        if trimmed.starts_with("/*") {
-            in_block_comment = true;
+        if let Some(pos) = trimmed.find("/*") {
+            // code before block
+            let before = &trimmed[..pos];
+            if !before.trim().is_empty() { stats.code_lines += 1; }
             stats.comment_lines += 1;
+            // same-line close?
+            if let Some(end) = trimmed[pos..].find("*/") {
+                let after = &trimmed[(pos + end + 2)..];
+                let after_trim = after.trim_start();
+                if !after_trim.is_empty() && !after_trim.starts_with("//") && !after_trim.starts_with('#') {
+                    stats.code_lines += 1;
+                }
+            } else {
+                in_block_comment = true;
+            }
             continue;
         }
         if trimmed.starts_with("//") || trimmed.starts_with("#") {
@@ -1092,6 +1115,14 @@ fn count_dcl_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
     let lines = read_file_lines_lossy(file_path)?;
     let mut stats = LanguageStats::default();
     let total_lines = lines.len() as u64;
+    // Quick sniff: if first non-blank line does not start with '$' or '!', treat as non-DCL and return zeroed stats
+    if let Some(first_nb) = lines.iter().find(|l| !l.trim().is_empty()) {
+        let t = first_nb.trim_start();
+        if !(t.starts_with('$') || t.starts_with('!')) {
+            return Ok((LanguageStats::default(), lines.len() as u64));
+        }
+    }
+
     for line in lines {
         let trimmed = line.trim();
         if trimmed.is_empty() { stats.blank_lines += 1; continue; }
@@ -1286,6 +1317,7 @@ fn scan_directory(
     _current_dir: &Path,
     metrics: &mut PerformanceMetrics,
     current_depth: usize,
+    entries_count: &mut usize,
     error_count: &mut usize,
 ) -> io::Result<HashMap<PathBuf, DirectoryStats>> {
     // Check max depth to prevent stack overflow
@@ -1352,6 +1384,10 @@ fn scan_directory(
             match entry {
                 Ok(path) => {
                     if path.is_file() {
+                        *entries_count += 1;
+                        if *entries_count > args.max_entries {
+                            return Err(io::Error::new(io::ErrorKind::Other, "Too many entries in directory tree"));
+                        }
                         if let Some(language) = path
                             .file_name()
                             .and_then(|n| n.to_str())
@@ -1404,6 +1440,10 @@ fn scan_directory(
                     continue;
                 }
             };
+            *entries_count += 1;
+            if *entries_count > args.max_entries {
+                return Err(io::Error::new(io::ErrorKind::Other, "Too many entries in directory tree"));
+            }
 
             let file_type = entry.file_type()?;
             if file_type.is_dir() && !file_type.is_symlink() {
@@ -1414,6 +1454,7 @@ fn scan_directory(
                         _current_dir,
                         metrics,
                         current_depth + 1,
+                        entries_count,
                         error_count,
                     ) {
                         Ok(sub_stats) => {
@@ -1515,7 +1556,16 @@ fn main() -> io::Result<()> {
 
     println!("Starting source code analysis...");
     // Start with depth 0 and track errors
-    let stats = scan_directory(path, &args, &current_dir, &mut metrics, 0, &mut error_count)?;
+    let mut entries_count: usize = 0;
+    let stats = scan_directory(
+        path,
+        &args,
+        &current_dir,
+        &mut metrics,
+        0,
+        &mut entries_count,
+        &mut error_count,
+    )?;
     metrics.print_final_stats();
 
     // Print detailed analysis with fixed-width directory field.
@@ -1680,12 +1730,14 @@ mod tests {
         )?;
         create_test_file(temp_dir.path(), "readme.md", "# Test Project")?;
         let mut error_count = 0;
+        let mut entries_count = 0usize;
         let stats = scan_directory(
             temp_dir.path(),
             &args,
             temp_dir.path(),
             &mut metrics,
             0,
+            &mut entries_count,
             &mut error_count,
         )?;
         let main_stats = stats.get(temp_dir.path()).unwrap();
