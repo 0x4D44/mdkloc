@@ -1,16 +1,20 @@
-# mdkloc
+# mdkloc v2.0.0
 
-A high-performance, multi-language source code analyzer written in Rust that provides detailed statistics about code, comment, and blank line distribution across your codebase.
+A fast, multi-language lines-of-code analyzer written in Rust. mdkloc reports per-language code, comment, and blank line counts by directory and totals. It aims to align with common tools (like tokei) while remaining simple and fast.
+
+## What’s New in 2.0.0
+
+- Major language expansion: Scala, YAML, JSON, XML (incl. SVG/XSL), HTML, TOML, CMake, Dockerfile, Makefile, INI, HCL/Terraform, ReStructuredText, Velocity, Mustache, Protobuf, plus classic languages: Algol, COBOL, Fortran, x86 Assembly, DCL (OpenVMS), and IPLAN (PSS/E).
+- Special-filename detection: Dockerfile, Makefile, CMakeLists.txt.
+- CLI enhancements: `--max-depth`, `--non-recursive`, and `--filespec` filtering; colored output.
+- Improved tests and stability.
 
 ## Features
 
-- **Multi-Language Support**: Analyzes source code in multiple programming languages, including:
-  - Systems: Rust, Go, C/C++
-  - JVM: Java
-  - .NET: C#
-  - Web: JavaScript, TypeScript, JSX, TSX, PHP
-  - Scripting: Python, Perl, Ruby, Shell
-  - Others: Pascal
+- **Multi-language support** (non-exhaustive):
+  - Core: Rust, Go, C/C++, Java, C#, Python, JavaScript/TypeScript (JSX/TSX), PHP, Perl, Ruby, Shell, Pascal
+  - Config/Markup: YAML, JSON, XML, HTML, TOML, INI, CMake, Makefile, Dockerfile, HCL/Terraform, ReStructuredText, Velocity, Mustache, Protobuf
+  - Classic/Legacy: Algol, COBOL, Fortran, Assembly, DCL (OpenVMS), IPLAN (PSS/E)
 
 - **Comprehensive Analysis**: Provides detailed statistics for each file and directory:
   - Code lines count
@@ -18,31 +22,25 @@ A high-performance, multi-language source code analyzer written in Rust that pro
   - Blank lines count
   - Per-language and overall metrics
 
-- **Performance Features**:
-  - Parallel processing capabilities
-  - Real-time progress tracking
-  - Performance metrics reporting
-  - Configurable entry limits for large directories
+- **Performance**:
+  - Real-time progress + performance metrics
+  - Efficient line counting per language
+  - Configurable entry limits and depth limits
 
-- **Smart Detection**:
-  - Automatic language detection based on file extensions
-  - Support for multiple comment styles (line, block, documentation)
-  - Unicode normalization for path handling
-  - Case-insensitive file extension matching
+- **Smart detection**:
+  - Extension-based language detection + special filenames (Dockerfile/Makefile/CMakeLists.txt)
+  - Multiple comment styles supported (line/block/doc, where applicable)
+  - Unicode normalization for paths; case-insensitive matching
 
 ## Installation
 
 To install the tool, you'll need Rust installed on your system. Then run:
 
-```bash
-cargo install source-code-analyzer  # Replace with actual crate name
-```
-
-Or build from source:
+Build from source:
 
 ```bash
 git clone <repository-url>
-cd source-code-analyzer
+cd mdkloc
 cargo build --release
 ```
 
@@ -51,31 +49,34 @@ cargo build --release
 Basic usage:
 
 ```bash
-source-code-analyzer [PATH]
+mdkloc [PATH]
 ```
 
 ### Command Line Options
 
 - `[PATH]`: Directory to analyze (defaults to current directory)
-- `-i, --ignore <PATHS>`: Directories to ignore (can be specified multiple times)
-- `-v, --verbose`: Enable verbose output with per-file statistics
-- `-m, --max-entries <NUMBER>`: Maximum number of entries to process (default: 1000000)
+- `-i, --ignore <PATH>`: Ignore directories (repeatable)
+- `-v, --verbose`: Per-file stats while scanning
+- `-m, --max-entries <N>`: Max entries to process (default: 1,000,000)
+- `-d, --max-depth <N>`: Limit recursion depth (default: 100)
+- `-n, --non-recursive`: Only analyze the top-level directory
+- `-f, --filespec <GLOB>`: Only include files matching the glob in each directory
 
 ### Examples
 
 Analyze current directory:
 ```bash
-source-code-analyzer
+mdkloc
 ```
 
 Analyze specific directory with ignored paths:
 ```bash
-source-code-analyzer /path/to/project --ignore node_modules --ignore target
+mdkloc /path/to/project --ignore node_modules --ignore target
 ```
 
 Enable verbose output:
 ```bash
-source-code-analyzer --verbose
+mdkloc --verbose
 ```
 
 ## Output Format
@@ -105,15 +106,26 @@ The tool provides three levels of output:
    Blank lines:    300 (9.8%)
    ```
 
-## Features by Language
+## Features by Language (selection)
 
 | Language    | Line Comments | Block Comments | Doc Comments | Special Features |
 |------------|---------------|----------------|--------------|------------------|
-| Rust       | //           | /* */         | /// //!      | Attribute support |
+| Rust       | //           | /* */         | /// //!      | Attribute lines count as code |
 | Python     | #            | ''' '''       | -            | Multi-line strings |
-| JavaScript | //           | /* */ <!--    | -            | JSX comments |
+| JavaScript | //           | /* */ <!--    | -            | JSX/HTML-style comments |
 | Ruby       | #            | =begin/=end   | -            | Shebang support |
 | Pascal     | //           | { } (* *)     | -            | Multiple block styles |
+| YAML/TOML  | #            | -             | -            | Hash comments only |
+| JSON       | -            | -             | -            | All non-blank is code |
+| XML/HTML   | -            | <!-- -->      | -            | Block comments only |
+| CMake      | #            | -             | -            | Line comments |
+| Makefile   | #            | -             | -            | Line comments |
+| HCL        | // #         | /* */         | -            | Line+block comments |
+| COBOL      | col-7 */     | -             | -            | Fixed/free comment forms |
+| Fortran    | ! / col-1    | -             | -            | Fixed-form indicators |
+| Assembly   | ; #          | -             | -            | Line comments |
+| DCL        | ! $!         | -             | -            | Line comments |
+| IPLAN      | !            | /* */         | -            | Line+block comments |
 
 ## Auto-Ignored Directories
 
@@ -163,4 +175,10 @@ The project includes comprehensive tests covering:
 
 ## License
 
-[Add your license information here]
+Licensed under the terms in LICENSE.
+
+---
+
+Notes
+- Some legacy/templating languages are handled with practical heuristics (e.g., Algol COMMENT…; COBOL column 7; Fortran fixed/free forms). If you have dialect-specific files, open an issue with examples and we can refine the counters.
+- To compare with tokei, use the Code column in both tools and ensure you scan the same directory set and language filters.

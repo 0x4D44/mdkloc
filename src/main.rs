@@ -6,7 +6,8 @@
 //! Supported languages: Rust, Go, Python, Java, C/C++, C#, JavaScript, TypeScript,
 //! PHP, Perl, Ruby, Shell, Pascal, Scala, YAML, XML, JSON, HTML, TOML,
 //! Makefile, Dockerfile, INI, HCL, CMake, PowerShell, Batch, TCL,
-//! ReStructuredText, Velocity, Mustache, Protobuf, SVG, XSL.
+//! ReStructuredText, Velocity, Mustache, Protobuf, SVG, XSL,
+//! Algol, COBOL, Fortran, Assembly, DCL, IPLAN.
 
 use clap::{ArgAction, Parser};
 use std::collections::HashMap;
@@ -39,7 +40,7 @@ struct PerformanceMetrics {
     author,
     version,
     about = "Source code analyser for multiple programming languages",
-    long_about = "Supported languages: Rust, Go, Python, Java, C/C++, C#, JavaScript, TypeScript, PHP, Perl, Ruby, Shell, Pascal, Scala, YAML, XML, JSON, HTML, TOML, Makefile, Dockerfile, INI, HCL, CMake, PowerShell, Batch, TCL, ReStructuredText, Velocity, Mustache, Protobuf, SVG, XSL.",
+    long_about = "Supported languages: Rust, Go, Python, Java, C/C++, C#, JavaScript, TypeScript, PHP, Perl, Ruby, Shell, Pascal, Scala, YAML, XML, JSON, HTML, TOML, Makefile, Dockerfile, INI, HCL, CMake, PowerShell, Batch, TCL, ReStructuredText, Velocity, Mustache, Protobuf, SVG, XSL, Algol, COBOL, Fortran, Assembly, DCL, IPLAN.",
     color = clap::ColorChoice::Always
 )]
 struct Args {
@@ -217,6 +218,18 @@ fn get_language_from_extension(file_name: &str) -> Option<&'static str> {
         // SVG / XSL
         "svg" => Some("SVG"),
         "xsl" | "xslt" => Some("XSL"),
+        // Algol
+        "alg" | "algol" | "a60" | "a68" => Some("Algol"),
+        // COBOL and copybooks
+        "cob" | "cbl" | "cobol" | "cpy" => Some("COBOL"),
+        // Fortran (fixed/free forms)
+        "f" | "for" | "f77" | "f90" | "f95" | "f03" | "f08" | "f18" | "F" | "F90" | "F95" => Some("Fortran"),
+        // Assembly (x86 et al.)
+        "asm" | "s" | "S" => Some("Assembly"),
+        // DCL (OpenVMS command procedures)
+        "com" => Some("DCL"),
+        // IPLAN (PSS/E)
+        "ipl" => Some("IPLAN"),
         _ => None,
     }
 }
@@ -296,6 +309,13 @@ fn count_lines_with_stats(file_path: &Path) -> io::Result<(LanguageStats, u64)> 
         "proto" => count_c_style_lines(file_path),
         "svg" => count_xml_like_lines(file_path),
         "xsl" | "xslt" => count_xml_like_lines(file_path),
+        // New classic languages
+        "alg" | "algol" | "a60" | "a68" => count_algol_lines(file_path),
+        "cob" | "cbl" | "cobol" | "cpy" => count_cobol_lines(file_path),
+        "f" | "for" | "f77" | "f90" | "f95" | "f03" | "f08" | "f18" | "f" | "f90" | "f95" => count_fortran_lines(file_path),
+        "asm" | "s" | "s" => count_asm_lines(file_path),
+        "com" => count_dcl_lines(file_path),
+        "ipl" => count_iplan_lines(file_path),
         _     => count_generic_lines(file_path),
     }
 }
@@ -978,6 +998,136 @@ fn count_mustache_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
             else if let Some(end) = trimmed[pos..].find("}}") {
                 let after = &trimmed[(pos + end + 2)..];
                 if !after.trim().is_empty() { stats.code_lines += 1; }
+            }
+            continue;
+        }
+        stats.code_lines += 1;
+    }
+    Ok((stats, total_lines))
+}
+
+// --- New classic languages ---
+
+fn count_algol_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
+    // Approximate support for ALGOL 60/68 comment styles:
+    // - Lines beginning with 'COMMENT' (case-insensitive) treated as comment (until ';' on the same line).
+    // - Single-line forms like 'co ... co' and '# ... #' are treated as full-line comments if they start the line.
+    let lines = read_file_lines_lossy(file_path)?;
+    let mut stats = LanguageStats::default();
+    let mut in_comment_until_semicolon = false;
+    let total_lines = lines.len() as u64;
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() { stats.blank_lines += 1; continue; }
+        let lower = trimmed.to_lowercase();
+        if in_comment_until_semicolon {
+            stats.comment_lines += 1;
+            if lower.contains(';') { in_comment_until_semicolon = false; }
+            continue;
+        }
+        if lower.starts_with("comment") {
+            stats.comment_lines += 1;
+            if !lower.contains(';') { in_comment_until_semicolon = true; }
+            continue;
+        }
+        if lower.starts_with("co ") && lower.ends_with(" co") { stats.comment_lines += 1; continue; }
+        if lower.starts_with('#') { stats.comment_lines += 1; continue; }
+        stats.code_lines += 1;
+    }
+    Ok((stats, total_lines))
+}
+
+fn count_cobol_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
+    // COBOL: fixed format comment indicator in column 7 ('*' or '/'),
+    // and free-format comment starting with '*>'. We treat lines accordingly.
+    let lines = read_file_lines_lossy(file_path)?;
+    let mut stats = LanguageStats::default();
+    let total_lines = lines.len() as u64;
+    for line in lines {
+        if line.trim().is_empty() { stats.blank_lines += 1; continue; }
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("*>") { stats.comment_lines += 1; continue; }
+        // Column 7 indicator (index 6, 0-based) in the original line
+        let col7 = line.chars().nth(6);
+        if matches!(col7, Some('*') | Some('/')) { stats.comment_lines += 1; continue; }
+        stats.code_lines += 1;
+    }
+    Ok((stats, total_lines))
+}
+
+fn count_fortran_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
+    // Fortran: '!' full-line comments; fixed-form comment if first column is C/c/*/D/d.
+    let lines = read_file_lines_lossy(file_path)?;
+    let mut stats = LanguageStats::default();
+    let total_lines = lines.len() as u64;
+    for line in lines {
+        if line.trim().is_empty() { stats.blank_lines += 1; continue; }
+        let first = line.chars().next().unwrap_or(' ');
+        let trimmed = line.trim_start();
+        if matches!(first, 'C' | 'c' | '*' | 'D' | 'd') { stats.comment_lines += 1; continue; }
+        if trimmed.starts_with('!') { stats.comment_lines += 1; continue; }
+        stats.code_lines += 1;
+    }
+    Ok((stats, total_lines))
+}
+
+fn count_asm_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
+    // Assembly (NASM/MASM ';' comments, GAS '#' comments). Full-line only.
+    let lines = read_file_lines_lossy(file_path)?;
+    let mut stats = LanguageStats::default();
+    let total_lines = lines.len() as u64;
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() { stats.blank_lines += 1; continue; }
+        if trimmed.starts_with(';') || trimmed.starts_with('#') || trimmed.starts_with("//") {
+            stats.comment_lines += 1; continue;
+        }
+        stats.code_lines += 1;
+    }
+    Ok((stats, total_lines))
+}
+
+fn count_dcl_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
+    // OpenVMS DCL: comments start with '!' or '$!' on a line. Commands typically start with '$'.
+    let lines = read_file_lines_lossy(file_path)?;
+    let mut stats = LanguageStats::default();
+    let total_lines = lines.len() as u64;
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() { stats.blank_lines += 1; continue; }
+        if trimmed.starts_with("$!") || trimmed.starts_with('!') { stats.comment_lines += 1; continue; }
+        stats.code_lines += 1;
+    }
+    Ok((stats, total_lines))
+}
+
+fn count_iplan_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
+    // PSS/E IPLAN: supports C-style block comments /* ... */ and '!' full-line comments.
+    let lines = read_file_lines_lossy(file_path)?;
+    let mut stats = LanguageStats::default();
+    let mut in_block = false;
+    let total_lines = lines.len() as u64;
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() { stats.blank_lines += 1; continue; }
+        if in_block {
+            stats.comment_lines += 1;
+            if let Some(pos) = trimmed.find("*/") {
+                in_block = false;
+                let after = &trimmed[(pos + 2)..];
+                if !after.trim().is_empty() && !after.trim_start().starts_with('!') { stats.code_lines += 1; }
+            }
+            continue;
+        }
+        if trimmed.starts_with('!') { stats.comment_lines += 1; continue; }
+        if let Some(pos) = trimmed.find("/*") {
+            let before = &trimmed[..pos];
+            if !before.trim().is_empty() { stats.code_lines += 1; }
+            stats.comment_lines += 1;
+            if !trimmed[pos..].contains("*/") { in_block = true; }
+            else if let Some(end) = trimmed[pos..].find("*/") {
+                let after = &trimmed[(pos + end + 2)..];
+                if !after.trim().is_empty() && !after.trim_start().starts_with('!') { stats.code_lines += 1; }
             }
             continue;
         }
@@ -1961,6 +2111,90 @@ mod tests {
         let (xsl_stats, _) = count_xml_like_lines(&temp_dir.path().join("sheet.xsl"))?;
         assert!(svg_stats.code_lines >= 1 && svg_stats.comment_lines >= 1);
         assert!(xsl_stats.code_lines >= 1 && xsl_stats.comment_lines >= 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_algol_line_counting() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            &temp_dir.path(),
+            "demo.alg",
+            "begin\nCOMMENT this is a comment;\nend\n",
+        )?;
+        let (stats, _total) = count_algol_lines(&temp_dir.path().join("demo.alg"))?;
+        assert_eq!(stats.code_lines, 2); // begin/end
+        assert_eq!(stats.comment_lines, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_cobol_line_counting() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            &temp_dir.path(),
+            "prog.cob",
+            "       IDENTIFICATION DIVISION.\n      * comment in col 7\n       PROGRAM-ID. DEMO.\n       *> free comment\n",
+        )?;
+        let (stats, _total) = count_cobol_lines(&temp_dir.path().join("prog.cob"))?;
+        assert_eq!(stats.comment_lines, 2);
+        assert!(stats.code_lines >= 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_fortran_line_counting() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            &temp_dir.path(),
+            "m.f90",
+            "! comment\nprogram x\nprint *, 'hi'\nend\n",
+        )?;
+        let (stats, _total) = count_fortran_lines(&temp_dir.path().join("m.f90"))?;
+        assert_eq!(stats.comment_lines, 1);
+        assert_eq!(stats.code_lines, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_asm_line_counting() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            &temp_dir.path(),
+            "x.asm",
+            "; c\n# also c\nmov eax, eax\n",
+        )?;
+        let (stats, _total) = count_asm_lines(&temp_dir.path().join("x.asm"))?;
+        assert_eq!(stats.comment_lines, 2);
+        assert_eq!(stats.code_lines, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_dcl_line_counting() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            &temp_dir.path(),
+            "proc.com",
+            "$! comment\n$ write sys$output \"hi\"\n",
+        )?;
+        let (stats, _total) = count_dcl_lines(&temp_dir.path().join("proc.com"))?;
+        assert_eq!(stats.comment_lines, 1);
+        assert_eq!(stats.code_lines, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_iplan_line_counting() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            &temp_dir.path(),
+            "calc.ipl",
+            "/* c */\n! c\nSET X = 1\n",
+        )?;
+        let (stats, _total) = count_iplan_lines(&temp_dir.path().join("calc.ipl"))?;
+        assert!(stats.comment_lines >= 2);
+        assert_eq!(stats.code_lines, 1);
         Ok(())
     }
 
