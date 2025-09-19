@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use colored::*;
 use glob::glob;
-use std::io::{BufRead, Read}; // Read for some functions; BufRead for buffered line reading
+use std::io::BufRead; // Buffered line reading
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -175,14 +175,15 @@ fn get_language_from_extension(file_name: &str) -> Option<&'static str> {
     }
     // Common shell dotfiles
     match lower.as_str() {
-        ".bashrc" | ".bash_profile" | ".profile" | ".zshrc" | ".zprofile" | ".zshenv" | ".kshrc" | ".cshrc" => {
+        ".bashrc" | ".bash_profile" | ".profile" | ".zshrc" | ".zprofile" | ".zshenv"
+        | ".kshrc" | ".cshrc" => {
             return Some("Shell");
         }
         _ => {}
     }
 
     // Extract extension if present
-    let (stem, ext) = match file_name.rsplit_once('.') {
+    let (_stem, ext) = match file_name.rsplit_once('.') {
         Some((s, e)) if !s.is_empty() => (s, e.to_lowercase()),
         _ => return None,
     };
@@ -287,10 +288,23 @@ fn truncate_start(s: &str, max_len: usize) -> String {
 /// Delegate counting to the appropriate parser based on file extension.
 fn count_lines_with_stats(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
     // Inspect filename for special cases (Dockerfile*, Makefile variants)
-    let file_name_lower = file_path.file_name().and_then(|n| n.to_str()).map(|s| s.to_lowercase()).unwrap_or_default();
-    if file_name_lower.starts_with("dockerfile") { return count_dockerfile_lines(file_path); }
-    if file_name_lower == "makefile" || file_name_lower == "gnumakefile" || file_name_lower == "bsdmakefile" { return count_makefile_lines(file_path); }
-    if file_name_lower == "cmakelists.txt" { return count_cmake_lines(file_path); }
+    let file_name_lower = file_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_lowercase())
+        .unwrap_or_default();
+    if file_name_lower.starts_with("dockerfile") {
+        return count_dockerfile_lines(file_path);
+    }
+    if file_name_lower == "makefile"
+        || file_name_lower == "gnumakefile"
+        || file_name_lower == "bsdmakefile"
+    {
+        return count_makefile_lines(file_path);
+    }
+    if file_name_lower == "cmakelists.txt" {
+        return count_cmake_lines(file_path);
+    }
     // Get extension in lowercase for case-insensitive matching.
     let extension = file_path
         .extension()
@@ -331,11 +345,13 @@ fn count_lines_with_stats(file_path: &Path) -> io::Result<(LanguageStats, u64)> 
         // New classic languages
         "alg" | "algol" | "a60" | "a68" => count_algol_lines(file_path),
         "cob" | "cbl" | "cobol" | "cpy" => count_cobol_lines(file_path),
-        "f" | "for" | "f77" | "f90" | "f95" | "f03" | "f08" | "f18" => count_fortran_lines(file_path),
+        "f" | "for" | "f77" | "f90" | "f95" | "f03" | "f08" | "f18" => {
+            count_fortran_lines(file_path)
+        }
         "asm" | "s" => count_asm_lines(file_path),
         "com" => count_dcl_lines(file_path),
         "ipl" => count_iplan_lines(file_path),
-        _     => count_generic_lines(file_path),
+        _ => count_generic_lines(file_path),
     }
 }
 
@@ -484,7 +500,9 @@ fn count_c_style_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
         if let Some(pos) = trimmed.find("/*") {
             // code before comment
             let before = &trimmed[..pos];
-            if !before.trim().is_empty() { stats.code_lines += 1; }
+            if !before.trim().is_empty() {
+                stats.code_lines += 1;
+            }
             stats.comment_lines += 1;
             // same-line close?
             if let Some(end) = trimmed[pos..].find("*/") {
@@ -613,13 +631,18 @@ fn count_php_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
         if let Some(pos) = trimmed.find("/*") {
             // code before block
             let before = &trimmed[..pos];
-            if !before.trim().is_empty() { stats.code_lines += 1; }
+            if !before.trim().is_empty() {
+                stats.code_lines += 1;
+            }
             stats.comment_lines += 1;
             // same-line close?
             if let Some(end) = trimmed[pos..].find("*/") {
                 let after = &trimmed[(pos + end + 2)..];
                 let after_trim = after.trim_start();
-                if !after_trim.is_empty() && !after_trim.starts_with("//") && !after_trim.starts_with('#') {
+                if !after_trim.is_empty()
+                    && !after_trim.starts_with("//")
+                    && !after_trim.starts_with('#')
+                {
                     stats.code_lines += 1;
                 }
             } else {
@@ -855,7 +878,7 @@ fn count_pascal_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
     Ok((stats, total_lines))
 }
 
-/// TOML: supports line comments with '#'.
+// TOML: supports line comments with '#'.
 // (removed duplicate count_toml_lines)
 
 /// Count lines for languages with hash-prefixed line comments only (e.g., YAML, TOML).
@@ -927,7 +950,10 @@ fn count_hcl_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
             if let Some(pos) = trimmed.find("*/") {
                 in_block_comment = false;
                 let after = &trimmed[(pos + 2)..];
-                if !after.trim().is_empty() && !after.trim_start().starts_with("//") && !after.trim_start().starts_with('#') {
+                if !after.trim().is_empty()
+                    && !after.trim_start().starts_with("//")
+                    && !after.trim_start().starts_with('#')
+                {
                     stats.code_lines += 1;
                 }
             }
@@ -950,7 +976,10 @@ fn count_hcl_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
                 in_block_comment = true;
             } else if let Some(end) = trimmed[pos..].find("*/") {
                 let after = &trimmed[(pos + end + 2)..];
-                if !after.trim().is_empty() && !after.trim_start().starts_with("//") && !after.trim_start().starts_with('#') {
+                if !after.trim().is_empty()
+                    && !after.trim_start().starts_with("//")
+                    && !after.trim_start().starts_with('#')
+                {
                     stats.code_lines += 1;
                 }
             }
@@ -967,7 +996,11 @@ fn count_rst_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
     let mut stats = LanguageStats::default();
     let total_lines = lines.len() as u64;
     for line in lines {
-        if line.trim().is_empty() { stats.blank_lines += 1; } else { stats.code_lines += 1; }
+        if line.trim().is_empty() {
+            stats.blank_lines += 1;
+        } else {
+            stats.code_lines += 1;
+        }
     }
     Ok((stats, total_lines))
 }
@@ -980,25 +1013,38 @@ fn count_velocity_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
     let total_lines = lines.len() as u64;
     for line in lines {
         let trimmed = line.trim();
-        if trimmed.is_empty() { stats.blank_lines += 1; continue; }
+        if trimmed.is_empty() {
+            stats.blank_lines += 1;
+            continue;
+        }
         if in_block {
             stats.comment_lines += 1;
             if let Some(pos) = trimmed.find("*#") {
                 in_block = false;
                 let after = &trimmed[(pos + 2)..];
-                if !after.trim().is_empty() && !after.trim_start().starts_with("##") { stats.code_lines += 1; }
+                if !after.trim().is_empty() && !after.trim_start().starts_with("##") {
+                    stats.code_lines += 1;
+                }
             }
             continue;
         }
-        if trimmed.starts_with("##") { stats.comment_lines += 1; continue; }
+        if trimmed.starts_with("##") {
+            stats.comment_lines += 1;
+            continue;
+        }
         if let Some(pos) = trimmed.find("#*") {
             let before = &trimmed[..pos];
-            if !before.trim().is_empty() { stats.code_lines += 1; }
+            if !before.trim().is_empty() {
+                stats.code_lines += 1;
+            }
             stats.comment_lines += 1;
-            if !trimmed[pos..].contains("*#") { in_block = true; }
-            else if let Some(end) = trimmed[pos..].find("*#") {
+            if !trimmed[pos..].contains("*#") {
+                in_block = true;
+            } else if let Some(end) = trimmed[pos..].find("*#") {
                 let after = &trimmed[(pos + end + 2)..];
-                if !after.trim().is_empty() && !after.trim_start().starts_with("##") { stats.code_lines += 1; }
+                if !after.trim().is_empty() && !after.trim_start().starts_with("##") {
+                    stats.code_lines += 1;
+                }
             }
             continue;
         }
@@ -1015,24 +1061,35 @@ fn count_mustache_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
     let total_lines = lines.len() as u64;
     for line in lines {
         let trimmed = line.trim();
-        if trimmed.is_empty() { stats.blank_lines += 1; continue; }
+        if trimmed.is_empty() {
+            stats.blank_lines += 1;
+            continue;
+        }
         if in_comment {
             stats.comment_lines += 1;
-            if let Some(pos) = trimmed.find("}}"){ // close
+            if let Some(pos) = trimmed.find("}}") {
+                // close
                 in_comment = false;
                 let after = &trimmed[(pos + 2)..];
-                if !after.trim().is_empty() { stats.code_lines += 1; }
+                if !after.trim().is_empty() {
+                    stats.code_lines += 1;
+                }
             }
             continue;
         }
         if let Some(pos) = trimmed.find("{{!") {
             let before = &trimmed[..pos];
-            if !before.trim().is_empty() { stats.code_lines += 1; }
+            if !before.trim().is_empty() {
+                stats.code_lines += 1;
+            }
             stats.comment_lines += 1;
-            if !trimmed[pos..].contains("}}") { in_comment = true; }
-            else if let Some(end) = trimmed[pos..].find("}}") {
+            if !trimmed[pos..].contains("}}") {
+                in_comment = true;
+            } else if let Some(end) = trimmed[pos..].find("}}") {
                 let after = &trimmed[(pos + end + 2)..];
-                if !after.trim().is_empty() { stats.code_lines += 1; }
+                if !after.trim().is_empty() {
+                    stats.code_lines += 1;
+                }
             }
             continue;
         }
@@ -1053,20 +1110,33 @@ fn count_algol_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
     let total_lines = lines.len() as u64;
     for line in lines {
         let trimmed = line.trim();
-        if trimmed.is_empty() { stats.blank_lines += 1; continue; }
+        if trimmed.is_empty() {
+            stats.blank_lines += 1;
+            continue;
+        }
         let lower = trimmed.to_lowercase();
         if in_comment_until_semicolon {
             stats.comment_lines += 1;
-            if lower.contains(';') { in_comment_until_semicolon = false; }
+            if lower.contains(';') {
+                in_comment_until_semicolon = false;
+            }
             continue;
         }
         if lower.starts_with("comment") {
             stats.comment_lines += 1;
-            if !lower.contains(';') { in_comment_until_semicolon = true; }
+            if !lower.contains(';') {
+                in_comment_until_semicolon = true;
+            }
             continue;
         }
-        if lower.starts_with("co ") && lower.ends_with(" co") { stats.comment_lines += 1; continue; }
-        if lower.starts_with('#') { stats.comment_lines += 1; continue; }
+        if lower.starts_with("co ") && lower.ends_with(" co") {
+            stats.comment_lines += 1;
+            continue;
+        }
+        if lower.starts_with('#') {
+            stats.comment_lines += 1;
+            continue;
+        }
         stats.code_lines += 1;
     }
     Ok((stats, total_lines))
@@ -1079,12 +1149,21 @@ fn count_cobol_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
     let mut stats = LanguageStats::default();
     let total_lines = lines.len() as u64;
     for line in lines {
-        if line.trim().is_empty() { stats.blank_lines += 1; continue; }
+        if line.trim().is_empty() {
+            stats.blank_lines += 1;
+            continue;
+        }
         let trimmed = line.trim_start();
-        if trimmed.starts_with("*>") { stats.comment_lines += 1; continue; }
+        if trimmed.starts_with("*>") {
+            stats.comment_lines += 1;
+            continue;
+        }
         // Column 7 indicator (index 6, 0-based) in the original line
         let col7 = line.chars().nth(6);
-        if matches!(col7, Some('*') | Some('/')) { stats.comment_lines += 1; continue; }
+        if matches!(col7, Some('*') | Some('/')) {
+            stats.comment_lines += 1;
+            continue;
+        }
         stats.code_lines += 1;
     }
     Ok((stats, total_lines))
@@ -1096,14 +1175,22 @@ fn count_fortran_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
     let mut stats = LanguageStats::default();
     let total_lines = lines.len() as u64;
     for line in lines {
-        if line.trim().is_empty() { stats.blank_lines += 1; continue; }
+        if line.trim().is_empty() {
+            stats.blank_lines += 1;
+            continue;
+        }
         let first = line.chars().next().unwrap_or(' ');
         let trimmed = line.trim_start();
-        if matches!(first, 'C' | 'c' | '*' | 'D' | 'd') { stats.comment_lines += 1; continue; }
+        if matches!(first, 'C' | 'c' | '*' | 'D' | 'd') {
+            stats.comment_lines += 1;
+            continue;
+        }
         if let Some(pos) = trimmed.find('!') {
             // code before '!' counts as code; rest as comment
             let before = &trimmed[..pos];
-            if !before.trim().is_empty() { stats.code_lines += 1; }
+            if !before.trim().is_empty() {
+                stats.code_lines += 1;
+            }
             stats.comment_lines += 1;
             continue;
         }
@@ -1119,9 +1206,13 @@ fn count_asm_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
     let total_lines = lines.len() as u64;
     for line in lines {
         let trimmed = line.trim();
-        if trimmed.is_empty() { stats.blank_lines += 1; continue; }
+        if trimmed.is_empty() {
+            stats.blank_lines += 1;
+            continue;
+        }
         if trimmed.starts_with(';') || trimmed.starts_with('#') || trimmed.starts_with("//") {
-            stats.comment_lines += 1; continue;
+            stats.comment_lines += 1;
+            continue;
         }
         stats.code_lines += 1;
     }
@@ -1143,8 +1234,14 @@ fn count_dcl_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
 
     for line in lines {
         let trimmed = line.trim();
-        if trimmed.is_empty() { stats.blank_lines += 1; continue; }
-        if trimmed.starts_with("$!") || trimmed.starts_with('!') { stats.comment_lines += 1; continue; }
+        if trimmed.is_empty() {
+            stats.blank_lines += 1;
+            continue;
+        }
+        if trimmed.starts_with("$!") || trimmed.starts_with('!') {
+            stats.comment_lines += 1;
+            continue;
+        }
         stats.code_lines += 1;
     }
     Ok((stats, total_lines))
@@ -1158,25 +1255,38 @@ fn count_iplan_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
     let total_lines = lines.len() as u64;
     for line in lines {
         let trimmed = line.trim();
-        if trimmed.is_empty() { stats.blank_lines += 1; continue; }
+        if trimmed.is_empty() {
+            stats.blank_lines += 1;
+            continue;
+        }
         if in_block {
             stats.comment_lines += 1;
             if let Some(pos) = trimmed.find("*/") {
                 in_block = false;
                 let after = &trimmed[(pos + 2)..];
-                if !after.trim().is_empty() && !after.trim_start().starts_with('!') { stats.code_lines += 1; }
+                if !after.trim().is_empty() && !after.trim_start().starts_with('!') {
+                    stats.code_lines += 1;
+                }
             }
             continue;
         }
-        if trimmed.starts_with('!') { stats.comment_lines += 1; continue; }
+        if trimmed.starts_with('!') {
+            stats.comment_lines += 1;
+            continue;
+        }
         if let Some(pos) = trimmed.find("/*") {
             let before = &trimmed[..pos];
-            if !before.trim().is_empty() { stats.code_lines += 1; }
+            if !before.trim().is_empty() {
+                stats.code_lines += 1;
+            }
             stats.comment_lines += 1;
-            if !trimmed[pos..].contains("*/") { in_block = true; }
-            else if let Some(end) = trimmed[pos..].find("*/") {
+            if !trimmed[pos..].contains("*/") {
+                in_block = true;
+            } else if let Some(end) = trimmed[pos..].find("*/") {
                 let after = &trimmed[(pos + end + 2)..];
-                if !after.trim().is_empty() && !after.trim_start().starts_with('!') { stats.code_lines += 1; }
+                if !after.trim().is_empty() && !after.trim_start().starts_with('!') {
+                    stats.code_lines += 1;
+                }
             }
             continue;
         }
@@ -1198,29 +1308,42 @@ fn count_powershell_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> 
     let total_lines = lines.len() as u64;
     for line in lines {
         let trimmed = line.trim();
-        if trimmed.is_empty() { stats.blank_lines += 1; continue; }
+        if trimmed.is_empty() {
+            stats.blank_lines += 1;
+            continue;
+        }
         if in_block_comment {
             stats.comment_lines += 1;
             if let Some(pos) = trimmed.find("#>") {
                 in_block_comment = false;
                 let after = &trimmed[(pos + 2)..];
-                if !after.trim().is_empty() && !after.trim_start().starts_with('#') { stats.code_lines += 1; }
+                if !after.trim().is_empty() && !after.trim_start().starts_with('#') {
+                    stats.code_lines += 1;
+                }
             }
             continue;
         }
         if let Some(pos) = trimmed.find("<#") {
             // code before block comment
             let before = &trimmed[..pos];
-            if !before.trim().is_empty() { stats.code_lines += 1; }
+            if !before.trim().is_empty() {
+                stats.code_lines += 1;
+            }
             stats.comment_lines += 1;
-            if !trimmed[pos..].contains("#>") { in_block_comment = true; }
-            else if let Some(end) = trimmed[pos..].find("#>") {
+            if !trimmed[pos..].contains("#>") {
+                in_block_comment = true;
+            } else if let Some(end) = trimmed[pos..].find("#>") {
                 let after = &trimmed[(pos + end + 2)..];
-                if !after.trim().is_empty() && !after.trim_start().starts_with('#') { stats.code_lines += 1; }
+                if !after.trim().is_empty() && !after.trim_start().starts_with('#') {
+                    stats.code_lines += 1;
+                }
             }
             continue;
         }
-        if trimmed.starts_with('#') { stats.comment_lines += 1; continue; }
+        if trimmed.starts_with('#') {
+            stats.comment_lines += 1;
+            continue;
+        }
         stats.code_lines += 1;
     }
     Ok((stats, total_lines))
@@ -1233,7 +1356,10 @@ fn count_batch_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
     let total_lines = lines.len() as u64;
     for line in lines {
         let trimmed = line.trim();
-        if trimmed.is_empty() { stats.blank_lines += 1; continue; }
+        if trimmed.is_empty() {
+            stats.blank_lines += 1;
+            continue;
+        }
         let upper = trimmed.to_uppercase();
         if upper.starts_with("REM ") || upper == "REM" || trimmed.starts_with("::") {
             stats.comment_lines += 1;
@@ -1253,10 +1379,16 @@ fn count_tcl_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
     for line in lines {
         line_no += 1;
         let trimmed = line.trim();
-        if trimmed.is_empty() { stats.blank_lines += 1; continue; }
+        if trimmed.is_empty() {
+            stats.blank_lines += 1;
+            continue;
+        }
         if trimmed.starts_with('#') {
-            if line_no == 1 && trimmed.starts_with("#!") { stats.code_lines += 1; }
-            else { stats.comment_lines += 1; }
+            if line_no == 1 && trimmed.starts_with("#!") {
+                stats.code_lines += 1;
+            } else {
+                stats.comment_lines += 1;
+            }
             continue;
         }
         stats.code_lines += 1;
@@ -1375,7 +1507,8 @@ fn scan_directory(
 
             if let Ok((ref file_stats, total_lines)) = count_lines_with_stats(path) {
                 metrics.update(total_lines);
-                let total_line_kinds = file_stats.code_lines + file_stats.comment_lines + file_stats.blank_lines;
+                let total_line_kinds =
+                    file_stats.code_lines + file_stats.comment_lines + file_stats.blank_lines;
                 if total_line_kinds > 0 {
                     let dir_stats = stats.entry(dir_path).or_default();
                     let (count, lang_stats) = dir_stats
@@ -1404,7 +1537,10 @@ fn scan_directory(
         let pattern_str = match pattern.to_str() {
             Some(s) => s,
             None => {
-                eprintln!("Warning: Non-UTF8 path in filespec at {} — skipping.", path.display());
+                eprintln!(
+                    "Warning: Non-UTF8 path in filespec at {} — skipping.",
+                    path.display()
+                );
                 return Ok(stats);
             }
         };
@@ -1414,7 +1550,7 @@ fn scan_directory(
                     if path.is_file() {
                         *entries_count += 1; // files-only limit
                         if *entries_count > args.max_entries {
-                            return Err(io::Error::new(io::ErrorKind::Other, "Too many entries in directory tree"));
+                            return Err(io::Error::other("Too many entries in directory tree"));
                         }
                         if let Some(language) = path
                             .file_name()
@@ -1429,7 +1565,9 @@ fn scan_directory(
                             match count_lines_with_stats(&path) {
                                 Ok((ref file_stats, total_lines)) => {
                                     metrics.update(total_lines);
-                                    let total_line_kinds = file_stats.code_lines + file_stats.comment_lines + file_stats.blank_lines;
+                                    let total_line_kinds = file_stats.code_lines
+                                        + file_stats.comment_lines
+                                        + file_stats.blank_lines;
                                     if total_line_kinds > 0 {
                                         let dir_stats = stats.entry(dir_path).or_default();
                                         let (count, lang_stats) = dir_stats
@@ -1471,7 +1609,7 @@ fn scan_directory(
                     continue;
                 }
             };
-            
+
             let file_type = entry.file_type()?;
             if file_type.is_dir() && !file_type.is_symlink() {
                 if !args.non_recursive {
@@ -1511,7 +1649,7 @@ fn scan_directory(
             } else if file_type.is_file() && !file_type.is_symlink() {
                 *entries_count += 1; // files-only limit
                 if *entries_count > args.max_entries {
-                    return Err(io::Error::new(io::ErrorKind::Other, "Too many entries in directory tree"));
+                    return Err(io::Error::other("Too many entries in directory tree"));
                 }
                 let file_name = entry.file_name().to_string_lossy().to_string();
                 if let Some(language) = get_language_from_extension(&file_name) {
@@ -1523,7 +1661,9 @@ fn scan_directory(
                     match count_lines_with_stats(&entry.path()) {
                         Ok((ref file_stats, total_lines)) => {
                             metrics.update(total_lines);
-                            let total_line_kinds = file_stats.code_lines + file_stats.comment_lines + file_stats.blank_lines;
+                            let total_line_kinds = file_stats.code_lines
+                                + file_stats.comment_lines
+                                + file_stats.blank_lines;
                             if total_line_kinds > 0 {
                                 let dir_stats = stats.entry(dir_path).or_default();
                                 let (count, lang_stats) = dir_stats
@@ -1557,21 +1697,24 @@ fn scan_directory(
 }
 
 /// Helper function to print stats for a language
-fn format_language_stats_line(prefix: &str, lang: &str, file_count: u64, stats: &LanguageStats) -> String {
+fn format_language_stats_line(
+    prefix: &str,
+    lang: &str,
+    file_count: u64,
+    stats: &LanguageStats,
+) -> String {
     format!(
         "{:<40} {:<12} {:>8} {:>10} {:>10} {:>10}",
-        prefix,
-        lang,
-        file_count,
-        stats.code_lines,
-        stats.comment_lines,
-        stats.blank_lines
+        prefix, lang, file_count, stats.code_lines, stats.comment_lines, stats.blank_lines
     )
 }
 
 fn print_language_stats(prefix: &str, lang: &str, file_count: u64, stats: &LanguageStats) {
     // Keep rows uncolored to ensure ANSI-safe alignment; headers are colored separately.
-    println!("{}", format_language_stats_line(prefix, lang, file_count, stats));
+    println!(
+        "{}",
+        format_language_stats_line(prefix, lang, file_count, stats)
+    );
 }
 
 fn main() -> io::Result<()> {
@@ -1612,7 +1755,7 @@ fn main() -> io::Result<()> {
     let mut sorted_stats: Vec<_> = stats.iter().collect();
     sorted_stats.sort_by(|(a, _), (b, _)| a.to_string_lossy().cmp(&b.to_string_lossy()));
 
-    println!("\n\n{}", "Detailed source code analysis:");
+    println!("\n\nDetailed source code analysis:");
     println!("{}", "-".repeat(100));
     println!(
         "{:<40} {:<12} {:>8} {:>10} {:>10} {:>10}",
@@ -1648,7 +1791,7 @@ fn main() -> io::Result<()> {
     }
 
     println!("{:-<100}", "");
-    println!("{}", "Totals by language:");
+    println!("Totals by language:");
 
     let mut sorted_totals: Vec<_> = total_by_language.iter().collect();
     sorted_totals.sort_by(|(a, _), (b, _)| a.cmp(b));
@@ -1789,7 +1932,7 @@ mod tests {
     fn test_rust_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(temp_dir.path(), "test.rs", "fn main() {\n// Line comment\n/* Block comment */\n/// Doc comment\n//! Module comment\nprintln!(\"Hello\");\n}\n")?;
-        let (stats, _total_lines) = count_rust_lines(&temp_dir.path().join("test.rs"))?;
+        let (stats, _total_lines) = count_rust_lines(temp_dir.path().join("test.rs").as_path())?;
         assert_eq!(stats.code_lines, 3);
         assert_eq!(stats.comment_lines, 4);
         assert_eq!(stats.blank_lines, 0);
@@ -1804,7 +1947,7 @@ mod tests {
             "test.py",
             "def main():\n# Line comment\n'''Block\ncomment'''\nprint('Hello')\n\n",
         )?;
-        let (stats, _total_lines) = count_python_lines(&temp_dir.path().join("test.py"))?;
+        let (stats, _total_lines) = count_python_lines(temp_dir.path().join("test.py").as_path())?;
         assert_eq!(stats.code_lines, 2);
         assert_eq!(stats.comment_lines, 3);
         assert_eq!(stats.blank_lines, 1);
@@ -1819,7 +1962,8 @@ mod tests {
             "test_ddq.py",
             "def main():\n\"\"\"Block\ncomment\"\"\"\nprint('Hello')\n",
         )?;
-        let (stats, _total_lines) = count_python_lines(&temp_dir.path().join("test_ddq.py"))?;
+        let (stats, _total_lines) =
+            count_python_lines(temp_dir.path().join("test_ddq.py").as_path())?;
         assert_eq!(stats.code_lines, 2);
         assert_eq!(stats.comment_lines, 2);
         Ok(())
@@ -1829,7 +1973,8 @@ mod tests {
     fn test_javascript_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(temp_dir.path(), "test.js", "function main() {\n// Line comment\n/* Block comment */\n/* Multi-line\ncomment */\n<!-- JSX comment -->\nconsole.log('Hello');\n}\n")?;
-        let (stats, _total_lines) = count_javascript_lines(&temp_dir.path().join("test.js"))?;
+        let (stats, _total_lines) =
+            count_javascript_lines(temp_dir.path().join("test.js").as_path())?;
         assert_eq!(stats.code_lines, 3);
         assert_eq!(stats.comment_lines, 5);
         assert_eq!(stats.blank_lines, 0);
@@ -1840,7 +1985,7 @@ mod tests {
     fn test_perl_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(temp_dir.path(), "test.pl", "#!/usr/bin/perl\n# Line comment\n=pod\nDocumentation block\n=cut\nprint \"Hello\";\n\n")?;
-        let (stats, _total_lines) = count_perl_lines(&temp_dir.path().join("test.pl"))?;
+        let (stats, _total_lines) = count_perl_lines(temp_dir.path().join("test.pl").as_path())?;
         assert_eq!(stats.code_lines, 2);
         assert_eq!(stats.comment_lines, 4);
         assert_eq!(stats.blank_lines, 1);
@@ -1851,7 +1996,7 @@ mod tests {
     fn test_ruby_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(temp_dir.path(), "test.rb", "#!/usr/bin/env ruby\n# This is a comment\nputs 'Hello, world!'\n=begin\nThis is a block comment\n=end\nputs 'Goodbye'\n")?;
-        let (stats, _total_lines) = count_ruby_lines(&temp_dir.path().join("test.rb"))?;
+        let (stats, _total_lines) = count_ruby_lines(temp_dir.path().join("test.rb").as_path())?;
         assert_eq!(stats.code_lines, 3);
         assert_eq!(stats.comment_lines, 4);
         Ok(())
@@ -1865,7 +2010,7 @@ mod tests {
             "test.sh",
             "#!/bin/bash\n# This is a comment\necho \"Hello, world!\"\n",
         )?;
-        let (stats, _total_lines) = count_shell_lines(&temp_dir.path().join("test.sh"))?;
+        let (stats, _total_lines) = count_shell_lines(temp_dir.path().join("test.sh").as_path())?;
         assert_eq!(stats.code_lines, 2);
         assert_eq!(stats.comment_lines, 1);
         Ok(())
@@ -1875,7 +2020,7 @@ mod tests {
     fn test_pascal_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(temp_dir.path(), "test.pas", "program Test;\n// This is a line comment\n{ This is a block comment }\nwriteln('Hello, world!');\n(* Another block comment\nspanning multiple lines *)\nwriteln('Goodbye');\n")?;
-        let (stats, _total_lines) = count_pascal_lines(&temp_dir.path().join("test.pas"))?;
+        let (stats, _total_lines) = count_pascal_lines(temp_dir.path().join("test.pas").as_path())?;
         assert_eq!(stats.code_lines, 3);
         assert_eq!(stats.comment_lines, 4);
         Ok(())
@@ -1920,7 +2065,8 @@ mod tests {
         let content = "first line\n\nsecond line\n   \nthird line\n";
         create_test_file(temp_dir.path(), "file.xyz", content)?;
 
-        let (stats, _total_lines) = count_generic_lines(&temp_dir.path().join("file.xyz"))?;
+        let (stats, _total_lines) =
+            count_generic_lines(temp_dir.path().join("file.xyz").as_path())?;
         assert_eq!(stats.code_lines, 3);
         assert_eq!(stats.blank_lines, 2);
         // Generic counting does not track comment lines
@@ -1953,11 +2099,11 @@ mod tests {
     fn test_yaml_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
-            &temp_dir.path(),
+            temp_dir.path(),
             "test.yaml",
             "# comment\nkey: value\n\nlist:\n  - item # inline text after value (treated as code)\n",
         )?;
-        let (stats, _total_lines) = count_yaml_lines(&temp_dir.path().join("test.yaml"))?;
+        let (stats, _total_lines) = count_yaml_lines(temp_dir.path().join("test.yaml").as_path())?;
         assert_eq!(stats.code_lines, 3); // key, list:, item
         assert_eq!(stats.comment_lines, 1);
         assert_eq!(stats.blank_lines, 1);
@@ -1968,11 +2114,11 @@ mod tests {
     fn test_toml_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
-            &temp_dir.path(),
+            temp_dir.path(),
             "Cargo.toml",
             "# comment\n[package]\nname = 'demo'\n\n[dependencies]\n",
         )?;
-        let (stats, _total_lines) = count_toml_lines(&temp_dir.path().join("Cargo.toml"))?;
+        let (stats, _total_lines) = count_toml_lines(temp_dir.path().join("Cargo.toml").as_path())?;
         assert_eq!(stats.code_lines, 3);
         assert_eq!(stats.comment_lines, 1);
         assert_eq!(stats.blank_lines, 1);
@@ -1983,11 +2129,11 @@ mod tests {
     fn test_json_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
-            &temp_dir.path(),
+            temp_dir.path(),
             "data.json",
             "{\n  \"k\": 1,\n  \"arr\": [1,2]\n}\n\n",
         )?;
-        let (stats, _total_lines) = count_json_lines(&temp_dir.path().join("data.json"))?;
+        let (stats, _total_lines) = count_json_lines(temp_dir.path().join("data.json").as_path())?;
         assert_eq!(stats.code_lines, 4);
         assert_eq!(stats.comment_lines, 0);
         assert_eq!(stats.blank_lines, 1);
@@ -1998,11 +2144,12 @@ mod tests {
     fn test_xml_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
-            &temp_dir.path(),
+            temp_dir.path(),
             "data.xml",
             "<root>\n<!-- c1 -->\n<!--\n block\n-->\n<child/>\n</root>\n",
         )?;
-        let (stats, _total_lines) = count_xml_like_lines(&temp_dir.path().join("data.xml"))?;
+        let (stats, _total_lines) =
+            count_xml_like_lines(temp_dir.path().join("data.xml").as_path())?;
         assert!(stats.code_lines >= 3);
         assert!(stats.comment_lines >= 3);
         assert_eq!(stats.blank_lines, 0);
@@ -2013,11 +2160,12 @@ mod tests {
     fn test_html_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
-            &temp_dir.path(),
+            temp_dir.path(),
             "index.html",
             "<html>\n<body>\n<!-- banner -->\n<div>hi</div>\n<!--\n multi\n-->\n</body>\n</html>\n",
         )?;
-        let (stats, _total_lines) = count_xml_like_lines(&temp_dir.path().join("index.html"))?;
+        let (stats, _total_lines) =
+            count_xml_like_lines(temp_dir.path().join("index.html").as_path())?;
         assert!(stats.code_lines >= 5); // <html>, <body>, <div>, </body>, </html>
         assert!(stats.comment_lines >= 3);
         Ok(())
@@ -2027,11 +2175,12 @@ mod tests {
     fn test_makefile_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
-            &temp_dir.path(),
+            temp_dir.path(),
             "Makefile",
             "# comment\n\nall:\n\t@echo hello # inline\n",
         )?;
-        let (stats, _total_lines) = count_makefile_lines(&temp_dir.path().join("Makefile"))?;
+        let (stats, _total_lines) =
+            count_makefile_lines(temp_dir.path().join("Makefile").as_path())?;
         assert_eq!(stats.code_lines, 2); // all:, recipe line
         assert_eq!(stats.comment_lines, 1);
         assert_eq!(stats.blank_lines, 1);
@@ -2048,11 +2197,12 @@ mod tests {
     fn test_dockerfile_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
-            &temp_dir.path(),
+            temp_dir.path(),
             "Dockerfile",
             "# comment\nFROM alpine\nRUN echo hi\n",
         )?;
-        let (stats, _total_lines) = count_dockerfile_lines(&temp_dir.path().join("Dockerfile"))?;
+        let (stats, _total_lines) =
+            count_dockerfile_lines(temp_dir.path().join("Dockerfile").as_path())?;
         assert_eq!(stats.code_lines, 2);
         assert_eq!(stats.comment_lines, 1);
         Ok(())
@@ -2062,11 +2212,11 @@ mod tests {
     fn test_ini_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
-            &temp_dir.path(),
+            temp_dir.path(),
             "config.ini",
             "; top comment\n# another\n[core]\nname = demo\n\n",
         )?;
-        let (stats, _total_lines) = count_ini_lines(&temp_dir.path().join("config.ini"))?;
+        let (stats, _total_lines) = count_ini_lines(temp_dir.path().join("config.ini").as_path())?;
         assert_eq!(stats.code_lines, 2);
         assert_eq!(stats.comment_lines, 2);
         assert_eq!(stats.blank_lines, 1);
@@ -2077,11 +2227,11 @@ mod tests {
     fn test_hcl_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
-            &temp_dir.path(),
+            temp_dir.path(),
             "main.tf",
             "# comment\n// also comment\nresource \"x\" \"y\" {\n  a = 1 /* inline */\n}\n/*\nblock\n*/\n",
         )?;
-        let (stats, _total_lines) = count_hcl_lines(&temp_dir.path().join("main.tf"))?;
+        let (stats, _total_lines) = count_hcl_lines(temp_dir.path().join("main.tf").as_path())?;
         assert!(stats.code_lines >= 3);
         assert!(stats.comment_lines >= 4);
         Ok(())
@@ -2091,11 +2241,12 @@ mod tests {
     fn test_cmake_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
-            &temp_dir.path(),
+            temp_dir.path(),
             "CMakeLists.txt",
             "# top\ncmake_minimum_required(VERSION 3.25)\nproject(demo)\n# end\n",
         )?;
-        let (stats, _total_lines) = count_cmake_lines(&temp_dir.path().join("CMakeLists.txt"))?;
+        let (stats, _total_lines) =
+            count_cmake_lines(temp_dir.path().join("CMakeLists.txt").as_path())?;
         assert_eq!(stats.code_lines, 2);
         assert_eq!(stats.comment_lines, 2);
         Ok(())
@@ -2105,11 +2256,12 @@ mod tests {
     fn test_powershell_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
-            &temp_dir.path(),
+            temp_dir.path(),
             "script.ps1",
             "# line\nWrite-Host 'hi'\n<# block\ncomment #> Write-Host 'after'\n",
         )?;
-        let (stats, _total_lines) = count_powershell_lines(&temp_dir.path().join("script.ps1"))?;
+        let (stats, _total_lines) =
+            count_powershell_lines(temp_dir.path().join("script.ps1").as_path())?;
         assert!(stats.code_lines >= 2);
         assert!(stats.comment_lines >= 2);
         Ok(())
@@ -2119,11 +2271,11 @@ mod tests {
     fn test_batch_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
-            &temp_dir.path(),
+            temp_dir.path(),
             "run.bat",
             "REM header\n:: also comment\n@echo on\nset X=1\n",
         )?;
-        let (stats, _total_lines) = count_batch_lines(&temp_dir.path().join("run.bat"))?;
+        let (stats, _total_lines) = count_batch_lines(temp_dir.path().join("run.bat").as_path())?;
         assert_eq!(stats.comment_lines, 2);
         assert_eq!(stats.code_lines, 2);
         Ok(())
@@ -2133,11 +2285,11 @@ mod tests {
     fn test_tcl_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
-            &temp_dir.path(),
+            temp_dir.path(),
             "prog.tcl",
             "#! /usr/bin/env tclsh\n# comment\nputs \"hello\"\n",
         )?;
-        let (stats, _total_lines) = count_tcl_lines(&temp_dir.path().join("prog.tcl"))?;
+        let (stats, _total_lines) = count_tcl_lines(temp_dir.path().join("prog.tcl").as_path())?;
         assert_eq!(stats.code_lines, 2); // shebang + puts
         assert_eq!(stats.comment_lines, 1);
         Ok(())
@@ -2147,11 +2299,11 @@ mod tests {
     fn test_rst_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
-            &temp_dir.path(),
+            temp_dir.path(),
             "doc.rst",
             "Title\n=====\n\n.. comment\n\nParagraph text.\n",
         )?;
-        let (stats, _total_lines) = count_rst_lines(&temp_dir.path().join("doc.rst"))?;
+        let (stats, _total_lines) = count_rst_lines(temp_dir.path().join("doc.rst").as_path())?;
         assert_eq!(stats.blank_lines, 2);
         assert_eq!(stats.comment_lines, 0);
         assert_eq!(stats.code_lines, 4);
@@ -2162,11 +2314,12 @@ mod tests {
     fn test_velocity_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
-            &temp_dir.path(),
+            temp_dir.path(),
             "template.vm",
             "## line comment\nHello #* block *# World\n#* multi\nline *#\n",
         )?;
-        let (stats, _total_lines) = count_velocity_lines(&temp_dir.path().join("template.vm"))?;
+        let (stats, _total_lines) =
+            count_velocity_lines(temp_dir.path().join("template.vm").as_path())?;
         assert!(stats.code_lines >= 2);
         assert!(stats.comment_lines >= 2);
         Ok(())
@@ -2176,11 +2329,12 @@ mod tests {
     fn test_mustache_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
-            &temp_dir.path(),
+            temp_dir.path(),
             "view.mustache",
             "{{! top }}\nHello {{name}}\n{{! multi\n line }}\n",
         )?;
-        let (stats, _total_lines) = count_mustache_lines(&temp_dir.path().join("view.mustache"))?;
+        let (stats, _total_lines) =
+            count_mustache_lines(temp_dir.path().join("view.mustache").as_path())?;
         assert!(stats.code_lines >= 1);
         assert!(stats.comment_lines >= 2);
         Ok(())
@@ -2190,11 +2344,12 @@ mod tests {
     fn test_proto_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
-            &temp_dir.path(),
+            temp_dir.path(),
             "msg.proto",
             "// comment\n/* block */\nsyntax = \"proto3\";\n",
         )?;
-        let (stats, _total_lines) = count_c_style_lines(&temp_dir.path().join("msg.proto"))?;
+        let (stats, _total_lines) =
+            count_c_style_lines(temp_dir.path().join("msg.proto").as_path())?;
         assert_eq!(stats.code_lines, 1);
         assert_eq!(stats.comment_lines, 2);
         Ok(())
@@ -2204,11 +2359,11 @@ mod tests {
     fn test_cstyle_inline_block_comment() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
-            &temp_dir.path(),
+            temp_dir.path(),
             "x.c",
             "int a; /* comment */ int b;\n/* start\n */ int c;\n",
         )?;
-        let (stats, _total_lines) = count_c_style_lines(&temp_dir.path().join("x.c"))?;
+        let (stats, _total_lines) = count_c_style_lines(temp_dir.path().join("x.c").as_path())?;
         // Expect 3 code lines: "int a;", "int b;" on first line, and "int c;" on third
         assert!(stats.code_lines >= 3);
         assert!(stats.comment_lines >= 2);
@@ -2219,11 +2374,11 @@ mod tests {
     fn test_php_inline_block_comment() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
-            &temp_dir.path(),
+            temp_dir.path(),
             "x.php",
             "<?php\n$y = 1; /* c */ $z = 2;\n?>\n",
         )?;
-        let (stats, _total_lines) = count_php_lines(&temp_dir.path().join("x.php"))?;
+        let (stats, _total_lines) = count_php_lines(temp_dir.path().join("x.php").as_path())?;
         assert!(stats.code_lines >= 2);
         assert!(stats.comment_lines >= 1);
         Ok(())
@@ -2232,10 +2387,14 @@ mod tests {
     #[test]
     fn test_svg_xsl_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
-        create_test_file(&temp_dir.path(), "pic.svg", "<svg><!-- c --><g/></svg>\n")?;
-        create_test_file(&temp_dir.path(), "sheet.xsl", "<xsl:stylesheet><!-- c --></xsl:stylesheet>\n")?;
-        let (svg_stats, _) = count_xml_like_lines(&temp_dir.path().join("pic.svg"))?;
-        let (xsl_stats, _) = count_xml_like_lines(&temp_dir.path().join("sheet.xsl"))?;
+        create_test_file(temp_dir.path(), "pic.svg", "<svg><!-- c --><g/></svg>\n")?;
+        create_test_file(
+            temp_dir.path(),
+            "sheet.xsl",
+            "<xsl:stylesheet><!-- c --></xsl:stylesheet>\n",
+        )?;
+        let (svg_stats, _) = count_xml_like_lines(temp_dir.path().join("pic.svg").as_path())?;
+        let (xsl_stats, _) = count_xml_like_lines(temp_dir.path().join("sheet.xsl").as_path())?;
         assert!(svg_stats.code_lines >= 1 && svg_stats.comment_lines >= 1);
         assert!(xsl_stats.code_lines >= 1 && xsl_stats.comment_lines >= 1);
         Ok(())
@@ -2245,11 +2404,11 @@ mod tests {
     fn test_algol_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
-            &temp_dir.path(),
+            temp_dir.path(),
             "demo.alg",
             "begin\nCOMMENT this is a comment;\nend\n",
         )?;
-        let (stats, _total) = count_algol_lines(&temp_dir.path().join("demo.alg"))?;
+        let (stats, _total) = count_algol_lines(temp_dir.path().join("demo.alg").as_path())?;
         assert_eq!(stats.code_lines, 2); // begin/end
         assert_eq!(stats.comment_lines, 1);
         Ok(())
@@ -2259,11 +2418,11 @@ mod tests {
     fn test_cobol_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
-            &temp_dir.path(),
+            temp_dir.path(),
             "prog.cob",
             "       IDENTIFICATION DIVISION.\n      * comment in col 7\n       PROGRAM-ID. DEMO.\n       *> free comment\n",
         )?;
-        let (stats, _total) = count_cobol_lines(&temp_dir.path().join("prog.cob"))?;
+        let (stats, _total) = count_cobol_lines(temp_dir.path().join("prog.cob").as_path())?;
         assert_eq!(stats.comment_lines, 2);
         assert!(stats.code_lines >= 2);
         Ok(())
@@ -2273,11 +2432,11 @@ mod tests {
     fn test_fortran_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
-            &temp_dir.path(),
+            temp_dir.path(),
             "m.f90",
             "! comment\nprogram x\nprint *, 'hi'\nend\n",
         )?;
-        let (stats, _total) = count_fortran_lines(&temp_dir.path().join("m.f90"))?;
+        let (stats, _total) = count_fortran_lines(temp_dir.path().join("m.f90").as_path())?;
         assert_eq!(stats.comment_lines, 1);
         assert_eq!(stats.code_lines, 3);
         Ok(())
@@ -2286,12 +2445,8 @@ mod tests {
     #[test]
     fn test_asm_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
-        create_test_file(
-            &temp_dir.path(),
-            "x.asm",
-            "; c\n# also c\nmov eax, eax\n",
-        )?;
-        let (stats, _total) = count_asm_lines(&temp_dir.path().join("x.asm"))?;
+        create_test_file(temp_dir.path(), "x.asm", "; c\n# also c\nmov eax, eax\n")?;
+        let (stats, _total) = count_asm_lines(temp_dir.path().join("x.asm").as_path())?;
         assert_eq!(stats.comment_lines, 2);
         assert_eq!(stats.code_lines, 1);
         Ok(())
@@ -2301,11 +2456,11 @@ mod tests {
     fn test_dcl_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
-            &temp_dir.path(),
+            temp_dir.path(),
             "proc.com",
             "$! comment\n$ write sys$output \"hi\"\n",
         )?;
-        let (stats, _total) = count_dcl_lines(&temp_dir.path().join("proc.com"))?;
+        let (stats, _total) = count_dcl_lines(temp_dir.path().join("proc.com").as_path())?;
         assert_eq!(stats.comment_lines, 1);
         assert_eq!(stats.code_lines, 1);
         Ok(())
@@ -2314,8 +2469,8 @@ mod tests {
     #[test]
     fn test_dcl_non_dcl_com_file_sniff() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
-        create_test_file(&temp_dir.path(), "not_dcl.com", "echo hi\n")?;
-        let (stats, _total) = count_dcl_lines(&temp_dir.path().join("not_dcl.com"))?;
+        create_test_file(temp_dir.path(), "not_dcl.com", "echo hi\n")?;
+        let (stats, _total) = count_dcl_lines(temp_dir.path().join("not_dcl.com").as_path())?;
         assert_eq!(stats.code_lines, 0);
         assert_eq!(stats.comment_lines, 0);
         Ok(())
@@ -2329,7 +2484,16 @@ mod tests {
 
     #[test]
     fn test_row_formatting_is_ansi_safe() {
-        let line = format_language_stats_line("./dir", "Rust", 12, &LanguageStats { code_lines: 34, comment_lines: 5, blank_lines: 6 });
+        let line = format_language_stats_line(
+            "./dir",
+            "Rust",
+            12,
+            &LanguageStats {
+                code_lines: 34,
+                comment_lines: 5,
+                blank_lines: 6,
+            },
+        );
         // No ANSI escape
         assert!(!line.contains('\u{1b}'));
         // Check widths (basic sanity)
@@ -2341,14 +2505,25 @@ mod tests {
     #[test]
     fn test_max_entries_enforced() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
-        let args = Args { max_entries: 1, ..test_args() };
+        let args = Args {
+            max_entries: 1,
+            ..test_args()
+        };
         let mut metrics = test_metrics();
         // Create two files
         create_test_file(temp_dir.path(), "a.rs", "fn main(){}\n")?;
         create_test_file(temp_dir.path(), "b.rs", "fn main(){}\n")?;
         let mut entries_count = 0usize;
         let mut error_count = 0usize;
-        let res = scan_directory(temp_dir.path(), &args, temp_dir.path(), &mut metrics, 0, &mut entries_count, &mut error_count);
+        let res = scan_directory(
+            temp_dir.path(),
+            &args,
+            temp_dir.path(),
+            &mut metrics,
+            0,
+            &mut entries_count,
+            &mut error_count,
+        );
         assert!(res.is_err());
         Ok(())
     }
@@ -2356,12 +2531,8 @@ mod tests {
     #[test]
     fn test_iplan_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
-        create_test_file(
-            &temp_dir.path(),
-            "calc.ipl",
-            "/* c */\n! c\nSET X = 1\n",
-        )?;
-        let (stats, _total) = count_iplan_lines(&temp_dir.path().join("calc.ipl"))?;
+        create_test_file(temp_dir.path(), "calc.ipl", "/* c */\n! c\nSET X = 1\n")?;
+        let (stats, _total) = count_iplan_lines(temp_dir.path().join("calc.ipl").as_path())?;
         assert!(stats.comment_lines >= 2);
         assert_eq!(stats.code_lines, 1);
         Ok(())
@@ -2371,7 +2542,7 @@ mod tests {
     fn test_scala_is_c_style() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
-            &temp_dir.path(),
+            temp_dir.path(),
             "Main.scala",
             "object Main {\n// comment\n/* block */\nval x = 1\n}\n",
         )?;
