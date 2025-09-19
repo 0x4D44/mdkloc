@@ -479,47 +479,95 @@ fn count_c_style_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
     let mut in_block_comment = false;
     let total_lines = lines.len() as u64;
     for line in lines {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+        let mut s = line.as_str();
+        let trimmed_line = s.trim();
+        if trimmed_line.is_empty() {
             stats.blank_lines += 1;
             continue;
         }
-        if in_block_comment {
-            stats.comment_lines += 1;
-            if trimmed.contains("*/") {
-                in_block_comment = false;
-                if let Some(code) = trimmed.split("*/").nth(1) {
-                    if !code.trim().is_empty() && !code.trim_start().starts_with("//") {
-                        stats.code_lines += 1;
+        loop {
+            if in_block_comment {
+                if let Some(end) = s.find("*/") {
+                    stats.comment_lines += 1;
+                    s = &s[end + 2..];
+                    in_block_comment = false;
+                    if s.trim().is_empty() {
+                        break;
+                    } else {
+                        continue;
+                    }
+                } else {
+                    stats.comment_lines += 1;
+                    break;
+                }
+            } else {
+                let p_line = s.find("//");
+                let p_block = s.find("/*");
+                match (p_line, p_block) {
+                    (None, None) => {
+                        if !s.trim().is_empty() {
+                            stats.code_lines += 1;
+                        }
+                        break;
+                    }
+                    (Some(pl), None) => {
+                        let before = &s[..pl];
+                        if !before.trim().is_empty() {
+                            stats.code_lines += 1;
+                        }
+                        stats.comment_lines += 1; // rest of line is comment
+                        break;
+                    }
+                    (None, Some(pb)) => {
+                        let before = &s[..pb];
+                        if !before.trim().is_empty() {
+                            stats.code_lines += 1;
+                        }
+                        stats.comment_lines += 1;
+                        s = &s[pb + 2..];
+                        if let Some(end) = s.find("*/") {
+                            s = &s[end + 2..];
+                            if s.trim().is_empty() {
+                                break;
+                            } else {
+                                continue;
+                            }
+                        } else {
+                            in_block_comment = true;
+                            break;
+                        }
+                    }
+                    (Some(pl), Some(pb)) => {
+                        if pl < pb {
+                            let before = &s[..pl];
+                            if !before.trim().is_empty() {
+                                stats.code_lines += 1;
+                            }
+                            stats.comment_lines += 1;
+                            break; // rest is comment
+                        } else {
+                            let before = &s[..pb];
+                            if !before.trim().is_empty() {
+                                stats.code_lines += 1;
+                            }
+                            stats.comment_lines += 1;
+                            s = &s[pb + 2..];
+                            if let Some(end) = s.find("*/") {
+                                s = &s[end + 2..];
+                                if s.trim().is_empty() {
+                                    break;
+                                } else {
+                                    continue;
+                                }
+                            } else {
+                                in_block_comment = true;
+                                break;
+                            }
+                        }
                     }
                 }
             }
-            continue;
         }
-        // Handle inline block comments and code around them
-        if let Some(pos) = trimmed.find("/*") {
-            // code before comment
-            let before = &trimmed[..pos];
-            if !before.trim().is_empty() {
-                stats.code_lines += 1;
-            }
-            stats.comment_lines += 1;
-            // same-line close?
-            if let Some(end) = trimmed[pos..].find("*/") {
-                let after = &trimmed[(pos + end + 2)..];
-                if !after.trim().is_empty() && !after.trim_start().starts_with("//") {
-                    stats.code_lines += 1;
-                }
-            } else {
-                in_block_comment = true;
-            }
-            continue;
-        }
-        if trimmed.starts_with("//") {
-            stats.comment_lines += 1;
-            continue;
-        }
-        stats.code_lines += 1;
     }
     Ok((stats, total_lines))
 }
@@ -1418,43 +1466,52 @@ fn count_xml_like_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
     let mut in_comment = false;
     let total_lines = lines.len() as u64;
     for line in lines {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+        let mut s = line.as_str();
+        let trimmed_line = s.trim();
+        if trimmed_line.is_empty() {
             stats.blank_lines += 1;
             continue;
         }
-        if in_comment {
-            stats.comment_lines += 1;
-            if let Some(pos) = trimmed.find("-->") {
-                in_comment = false;
-                // Anything after the closing marker counts as code if not blank
-                let after = &trimmed[(pos + 3)..];
-                if !after.trim().is_empty() {
+        loop {
+            if in_comment {
+                if let Some(end) = s.find("-->") {
+                    stats.comment_lines += 1;
+                    s = &s[end + 3..];
+                    in_comment = false;
+                    if s.trim().is_empty() {
+                        break;
+                    } else {
+                        continue;
+                    }
+                } else {
+                    stats.comment_lines += 1;
+                    break;
+                }
+            } else if let Some(pos) = s.find("<!--") {
+                let before = &s[..pos];
+                if !before.trim().is_empty() {
                     stats.code_lines += 1;
                 }
-            }
-            continue;
-        }
-        if let Some(pos) = trimmed.find("<!--") {
-            // Count potential code before the comment start
-            let before = &trimmed[..pos];
-            if !before.trim().is_empty() {
-                stats.code_lines += 1;
-            }
-            stats.comment_lines += 1;
-            if !trimmed[pos..].contains("-->") {
-                in_comment = true;
-            } else if let Some(end) = trimmed[pos..].find("-->") {
-                // Check for trailing code after closing marker on same line
-                let after = &trimmed[(pos + end + 3)..];
-                if !after.trim().is_empty() {
+                stats.comment_lines += 1;
+                s = &s[pos + 4..];
+                if let Some(end) = s.find("-->") {
+                    s = &s[end + 3..];
+                    if s.trim().is_empty() {
+                        break;
+                    } else {
+                        continue;
+                    }
+                } else {
+                    in_comment = true;
+                    break;
+                }
+            } else {
+                if !s.trim().is_empty() {
                     stats.code_lines += 1;
                 }
+                break;
             }
-            continue;
         }
-        // Not in comment and no comment delimiter on this line -> code
-        stats.code_lines += 1;
     }
     Ok((stats, total_lines))
 }
@@ -1471,7 +1528,7 @@ fn scan_directory(
     error_count: &mut usize,
 ) -> io::Result<HashMap<PathBuf, DirectoryStats>> {
     // Check max depth to prevent stack overflow
-    if current_depth >= args.max_depth {
+    if current_depth > args.max_depth {
         eprintln!(
             "Warning: Maximum directory depth ({}) reached at {}",
             args.max_depth,
@@ -2371,6 +2428,20 @@ mod tests {
     }
 
     #[test]
+    fn test_cstyle_multiple_pairs_one_line() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "y.c",
+            "int a; /* c1 */ mid /* c2 */ end;\n",
+        )?;
+        let (stats, _total_lines) = count_c_style_lines(temp_dir.path().join("y.c").as_path())?;
+        assert!(stats.code_lines >= 3);
+        assert!(stats.comment_lines >= 2);
+        Ok(())
+    }
+
+    #[test]
     fn test_php_inline_block_comment() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
@@ -2397,6 +2468,117 @@ mod tests {
         let (xsl_stats, _) = count_xml_like_lines(temp_dir.path().join("sheet.xsl").as_path())?;
         assert!(svg_stats.code_lines >= 1 && svg_stats.comment_lines >= 1);
         assert!(xsl_stats.code_lines >= 1 && xsl_stats.comment_lines >= 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_xml_multiple_pairs_one_line() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(temp_dir.path(), "z.xml", "<a><!--c1--><b/><!--c2--></a>\n")?;
+        let (stats, _total) = count_xml_like_lines(temp_dir.path().join("z.xml").as_path())?;
+        assert!(stats.code_lines >= 1);
+        assert!(stats.comment_lines >= 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_max_depth_children_not_grandchildren() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        let child = root.join("child");
+        let grand = child.join("grand");
+        fs::create_dir(&child)?;
+        fs::create_dir(&grand)?;
+        create_test_file(root, "a.rs", "fn main(){}\n")?;
+        create_test_file(&child, "b.rs", "fn main(){}\n")?;
+        create_test_file(&grand, "c.rs", "fn main(){}\n")?;
+
+        let args = Args {
+            max_depth: 1,
+            ..test_args()
+        };
+        let mut metrics = test_metrics();
+        let mut entries_count = 0usize;
+        let mut error_count = 0usize;
+        let stats = scan_directory(
+            root,
+            &args,
+            root,
+            &mut metrics,
+            0,
+            &mut entries_count,
+            &mut error_count,
+        )?;
+        // Count Rust files aggregated across all dirs in stats
+        let mut rust_files = 0u64;
+        for dir in stats.values() {
+            if let Some((n, _)) = dir.language_stats.get("Rust") {
+                rust_files += *n;
+            }
+        }
+        assert_eq!(rust_files, 2); // root and child only
+        Ok(())
+    }
+
+    #[test]
+    fn test_filespec_filters_rs_only() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        create_test_file(root, "a.rs", "fn main(){}\n")?;
+        create_test_file(root, "b.py", "print('x')\n")?;
+        let args = Args {
+            filespec: Some("*.rs".to_string()),
+            ..test_args()
+        };
+        let mut metrics = test_metrics();
+        let mut entries_count = 0usize;
+        let mut error_count = 0usize;
+        let stats = scan_directory(
+            root,
+            &args,
+            root,
+            &mut metrics,
+            0,
+            &mut entries_count,
+            &mut error_count,
+        )?;
+        // Assert only Rust present
+        for dir in stats.values() {
+            for (lang, (n, _)) in &dir.language_stats {
+                assert_eq!(lang.as_str(), "Rust");
+                assert_eq!(*n, 1);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_skip_zero_stat_dcl_in_aggregation() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        create_test_file(root, "not_dcl.com", "echo hi\n")?;
+        create_test_file(root, "a.rs", "fn main(){}\n")?;
+        let args = test_args();
+        let mut metrics = test_metrics();
+        let mut entries_count = 0usize;
+        let mut error_count = 0usize;
+        let stats = scan_directory(
+            root,
+            &args,
+            root,
+            &mut metrics,
+            0,
+            &mut entries_count,
+            &mut error_count,
+        )?;
+        let mut has_dcl = false;
+        for dir in stats.values() {
+            if dir.language_stats.contains_key("DCL") {
+                has_dcl = true;
+                break;
+            }
+        }
+        assert!(!has_dcl);
         Ok(())
     }
 
