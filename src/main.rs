@@ -985,55 +985,96 @@ fn count_ini_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
 fn count_hcl_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
     let lines = read_file_lines_lossy(file_path)?;
     let mut stats = LanguageStats::default();
-    let mut in_block_comment = false;
+    let mut in_block = false;
     let total_lines = lines.len() as u64;
     for line in lines {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+        let mut s = line.as_str();
+        let trimmed_line = s.trim();
+        if trimmed_line.is_empty() {
             stats.blank_lines += 1;
             continue;
         }
-        if in_block_comment {
-            stats.comment_lines += 1;
-            if let Some(pos) = trimmed.find("*/") {
-                in_block_comment = false;
-                let after = &trimmed[(pos + 2)..];
-                if !after.trim().is_empty()
-                    && !after.trim_start().starts_with("//")
-                    && !after.trim_start().starts_with('#')
-                {
-                    stats.code_lines += 1;
+        loop {
+            if in_block {
+                if let Some(end) = s.find("*/") {
+                    stats.comment_lines += 1;
+                    s = &s[end + 2..];
+                    in_block = false;
+                    if s.trim().is_empty() {
+                        break;
+                    } else {
+                        continue;
+                    }
+                } else {
+                    stats.comment_lines += 1;
+                    break;
+                }
+            } else {
+                let p_line1 = s.find("//");
+                let p_line2 = s.find('#');
+                let p_block = s.find("/*");
+                let mut next: Option<(&str, usize)> = None;
+                if let Some(i) = p_line1 {
+                    next = Some(("//", i));
+                }
+                if let Some(i) = p_line2 {
+                    next = match next {
+                        Some((k, j)) if j <= i => Some((k, j)),
+                        _ => Some(("#", i)),
+                    };
+                }
+                if let Some(i) = p_block {
+                    next = match next {
+                        Some((k, j)) if j <= i => Some((k, j)),
+                        _ => Some(("/*", i)),
+                    };
+                }
+                match next {
+                    None => {
+                        if !s.trim().is_empty() {
+                            stats.code_lines += 1;
+                        }
+                        break;
+                    }
+                    Some(("//", i)) => {
+                        let before = &s[..i];
+                        if !before.trim().is_empty() {
+                            stats.code_lines += 1;
+                        }
+                        stats.comment_lines += 1;
+                        break;
+                    }
+                    Some(("#", i)) => {
+                        let before = &s[..i];
+                        if !before.trim().is_empty() {
+                            stats.code_lines += 1;
+                        }
+                        stats.comment_lines += 1;
+                        break;
+                    }
+                    Some(("/*", i)) => {
+                        let before = &s[..i];
+                        if !before.trim().is_empty() {
+                            stats.code_lines += 1;
+                        }
+                        stats.comment_lines += 1;
+                        s = &s[i + 2..];
+                        if let Some(end) = s.find("*/") {
+                            s = &s[end + 2..];
+                            if s.trim().is_empty() {
+                                break;
+                            } else {
+                                continue;
+                            }
+                        } else {
+                            in_block = true;
+                            break;
+                        }
+                    }
+                    _ => unreachable!(),
                 }
             }
-            continue;
         }
-        // Line comments in HCL: // or # at line start
-        if trimmed.starts_with("//") || trimmed.starts_with('#') {
-            stats.comment_lines += 1;
-            continue;
-        }
-        // Block comments like C: /* ... */
-        if let Some(pos) = trimmed.find("/*") {
-            // Count code before comment
-            let before = &trimmed[..pos];
-            if !before.trim().is_empty() {
-                stats.code_lines += 1;
-            }
-            stats.comment_lines += 1;
-            if !trimmed[pos..].contains("*/") {
-                in_block_comment = true;
-            } else if let Some(end) = trimmed[pos..].find("*/") {
-                let after = &trimmed[(pos + end + 2)..];
-                if !after.trim().is_empty()
-                    && !after.trim_start().starts_with("//")
-                    && !after.trim_start().starts_with('#')
-                {
-                    stats.code_lines += 1;
-                }
-            }
-            continue;
-        }
-        stats.code_lines += 1;
     }
     Ok((stats, total_lines))
 }
@@ -1352,47 +1393,98 @@ fn count_powershell_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> 
     // PowerShell supports '#' line comments and <# ... #> block comments.
     let lines = read_file_lines_lossy(file_path)?;
     let mut stats = LanguageStats::default();
-    let mut in_block_comment = false;
+    let mut in_block = false;
     let total_lines = lines.len() as u64;
     for line in lines {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+        let mut s = line.as_str();
+        let trimmed_line = s.trim();
+        if trimmed_line.is_empty() {
             stats.blank_lines += 1;
             continue;
         }
-        if in_block_comment {
-            stats.comment_lines += 1;
-            if let Some(pos) = trimmed.find("#>") {
-                in_block_comment = false;
-                let after = &trimmed[(pos + 2)..];
-                if !after.trim().is_empty() && !after.trim_start().starts_with('#') {
-                    stats.code_lines += 1;
+        loop {
+            if in_block {
+                if let Some(end) = s.find("#>") {
+                    stats.comment_lines += 1;
+                    s = &s[end + 2..];
+                    in_block = false;
+                    if s.trim().is_empty() {
+                        break;
+                    } else {
+                        continue;
+                    }
+                } else {
+                    stats.comment_lines += 1;
+                    break;
+                }
+            } else {
+                let p_line = s.find('#');
+                let p_block = s.find("<#");
+                match (p_line, p_block) {
+                    (None, None) => {
+                        if !s.trim().is_empty() {
+                            stats.code_lines += 1;
+                        }
+                        break;
+                    }
+                    (Some(pl), None) => {
+                        let before = &s[..pl];
+                        if !before.trim().is_empty() {
+                            stats.code_lines += 1;
+                        }
+                        stats.comment_lines += 1;
+                        break;
+                    }
+                    (None, Some(pb)) => {
+                        let before = &s[..pb];
+                        if !before.trim().is_empty() {
+                            stats.code_lines += 1;
+                        }
+                        stats.comment_lines += 1;
+                        s = &s[pb + 2..];
+                        if let Some(end) = s.find("#>") {
+                            s = &s[end + 2..];
+                            if s.trim().is_empty() {
+                                break;
+                            } else {
+                                continue;
+                            }
+                        } else {
+                            in_block = true;
+                            break;
+                        }
+                    }
+                    (Some(pl), Some(pb)) => {
+                        if pl < pb {
+                            let before = &s[..pl];
+                            if !before.trim().is_empty() {
+                                stats.code_lines += 1;
+                            }
+                            stats.comment_lines += 1;
+                            break;
+                        } else {
+                            let before = &s[..pb];
+                            if !before.trim().is_empty() {
+                                stats.code_lines += 1;
+                            }
+                            stats.comment_lines += 1;
+                            s = &s[pb + 2..];
+                            if let Some(end) = s.find("#>") {
+                                s = &s[end + 2..];
+                                if s.trim().is_empty() {
+                                    break;
+                                } else {
+                                    continue;
+                                }
+                            } else {
+                                in_block = true;
+                                break;
+                            }
+                        }
+                    }
                 }
             }
-            continue;
         }
-        if let Some(pos) = trimmed.find("<#") {
-            // code before block comment
-            let before = &trimmed[..pos];
-            if !before.trim().is_empty() {
-                stats.code_lines += 1;
-            }
-            stats.comment_lines += 1;
-            if !trimmed[pos..].contains("#>") {
-                in_block_comment = true;
-            } else if let Some(end) = trimmed[pos..].find("#>") {
-                let after = &trimmed[(pos + end + 2)..];
-                if !after.trim().is_empty() && !after.trim_start().starts_with('#') {
-                    stats.code_lines += 1;
-                }
-            }
-            continue;
-        }
-        if trimmed.starts_with('#') {
-            stats.comment_lines += 1;
-            continue;
-        }
-        stats.code_lines += 1;
     }
     Ok((stats, total_lines))
 }
@@ -2731,6 +2823,157 @@ mod tests {
         let (stats, _total_lines) = count_c_style_lines(&temp_dir.path().join("Main.scala"))?;
         assert_eq!(stats.code_lines, 3);
         assert_eq!(stats.comment_lines, 2);
+        Ok(())
+    }
+
+    // Additional hardening tests
+
+    #[test]
+    fn test_cobol_short_line_and_leading_spaces() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        // Short line (<7 chars) should not be treated as comment
+        create_test_file(temp_dir.path(), "short.cob", "*\n")?;
+        let (stats1, _) = count_cobol_lines(temp_dir.path().join("short.cob").as_path())?;
+        assert_eq!(stats1.code_lines, 1);
+        // Leading spaces then '*' in column 1 is code (not fixed-form comment)
+        create_test_file(temp_dir.path(), "lead.cob", "   * TEXT\n")?;
+        let (stats2, _) = count_cobol_lines(temp_dir.path().join("lead.cob").as_path())?;
+        assert_eq!(stats2.code_lines, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_fortran_fixed_vs_free_form() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        // Fixed-form comment indicator in col 1
+        create_test_file(temp_dir.path(), "f1.f", "C comment\n")?;
+        let (s1, _) = count_fortran_lines(temp_dir.path().join("f1.f").as_path())?;
+        assert_eq!(s1.comment_lines, 1);
+        // Leading space then 'C' is code (free form)
+        create_test_file(temp_dir.path(), "f2.f", " C not comment\n")?;
+        let (s2, _) = count_fortran_lines(temp_dir.path().join("f2.f").as_path())?;
+        assert_eq!(s2.code_lines, 1);
+        // Inline '!' split
+        create_test_file(temp_dir.path(), "f3.f90", "print *, 'x' ! trailing\n")?;
+        let (s3, _) = count_fortran_lines(temp_dir.path().join("f3.f90").as_path())?;
+        assert_eq!(s3.code_lines, 1);
+        assert_eq!(s3.comment_lines, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_hcl_multiple_pairs_inline() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(temp_dir.path(), "x.tf", "a=1 /*c*/ b=2 /*d*/ c=3\n")?;
+        let (stats, _) = count_hcl_lines(temp_dir.path().join("x.tf").as_path())?;
+        assert!(stats.code_lines >= 3);
+        assert!(stats.comment_lines >= 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_powershell_inline_and_multiblock() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "ps.ps1",
+            "Write-Host 'a' <# c #> 'b' <# d #> 'c'\n",
+        )?;
+        let (s1, _) = count_powershell_lines(temp_dir.path().join("ps.ps1").as_path())?;
+        assert!(s1.code_lines >= 3);
+        assert!(s1.comment_lines >= 2);
+        create_test_file(
+            temp_dir.path(),
+            "ps2.ps1",
+            "Write-Host 'x'\n<#\nblock\n#> Write-Host 'y'\n",
+        )?;
+        let (s2, _) = count_powershell_lines(temp_dir.path().join("ps2.ps1").as_path())?;
+        assert!(s2.code_lines >= 2);
+        assert!(s2.comment_lines >= 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_pascal_mixed_nested_blocks() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "p.pas",
+            "{c1} (*c2*) code\n(* multi\nline *) code2\n",
+        )?;
+        let (stats, _) = count_pascal_lines(temp_dir.path().join("p.pas").as_path())?;
+        assert!(stats.comment_lines >= 3);
+        assert!(stats.code_lines >= 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_perl_pod_block() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "p.pl",
+            "print 'x';\n=pod\nthis is pod\n=cut\nprint 'y';\n",
+        )?;
+        let (stats, _) = count_perl_lines(temp_dir.path().join("p.pl").as_path())?;
+        assert!(stats.comment_lines >= 3);
+        assert_eq!(stats.code_lines, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_inline_hash_is_code_for_hash_langs() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(temp_dir.path(), "a.yaml", "key: 1 # inline\n")?;
+        let (yml, _) = count_yaml_lines(temp_dir.path().join("a.yaml").as_path())?;
+        assert_eq!(yml.code_lines, 1);
+        create_test_file(temp_dir.path(), "a.toml", "name='x' # inline\n")?;
+        let (toml, _) = count_toml_lines(temp_dir.path().join("a.toml").as_path())?;
+        assert_eq!(toml.code_lines, 1);
+        create_test_file(temp_dir.path(), "a.ini", "name=value ; inline\n")?;
+        let (ini, _) = count_ini_lines(temp_dir.path().join("a.ini").as_path())?;
+        assert_eq!(ini.code_lines, 1);
+        create_test_file(temp_dir.path(), "CMakeLists.txt", "set(X 1) # inline\n")?;
+        let (cmake, _) = count_cmake_lines(temp_dir.path().join("CMakeLists.txt").as_path())?;
+        assert_eq!(cmake.code_lines, 1);
+        create_test_file(temp_dir.path(), "Makefile", "VAR=1 # inline\n")?;
+        let (mk, _) = count_makefile_lines(temp_dir.path().join("Makefile").as_path())?;
+        assert_eq!(mk.code_lines, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_non_recursive_root_only() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        let child = root.join("child");
+        fs::create_dir(&child)?;
+        create_test_file(root, "a.rs", "fn main(){}\n")?;
+        create_test_file(&child, "b.rs", "fn main(){}\n")?;
+        let args = Args {
+            non_recursive: true,
+            ..test_args()
+        };
+        let mut metrics = test_metrics();
+        let mut entries_count = 0usize;
+        let mut error_count = 0usize;
+        let stats = scan_directory(
+            root,
+            &args,
+            root,
+            &mut metrics,
+            0,
+            &mut entries_count,
+            &mut error_count,
+        )?;
+        // Ensure only one Rust file counted
+        let mut rust_files = 0u64;
+        for dir in stats.values() {
+            if let Some((n, _)) = dir.language_stats.get("Rust") {
+                rust_files += *n;
+            }
+        }
+        assert_eq!(rust_files, 1);
         Ok(())
     }
 }
