@@ -3,7 +3,10 @@
 //! This tool performs comprehensive analysis of source code across multiple programming languages,
 //! providing detailed statistics about code, comment, and blank line distribution.
 //! 
-//! Supported languages: Rust, Go, Python, Java, C/C++, C#, JavaScript, TypeScript, PHP, Perl, Ruby, Shell, Pascal.
+//! Supported languages: Rust, Go, Python, Java, C/C++, C#, JavaScript, TypeScript,
+//! PHP, Perl, Ruby, Shell, Pascal, Scala, YAML, XML, JSON, HTML, TOML,
+//! Makefile, Dockerfile, INI, HCL, CMake, PowerShell, Batch, TCL,
+//! ReStructuredText, Velocity, Mustache, Protobuf, SVG, XSL.
 
 use std::collections::HashMap;
 use clap::Parser;
@@ -35,7 +38,7 @@ struct PerformanceMetrics {
     author,
     version,
     about = "Source code analyser for multiple programming languages",
-    long_about = "Supported languages: Rust, Go, Python, Java, C/C++, C#, JavaScript, TypeScript, PHP, Perl, Ruby, Shell, Pascal."
+    long_about = "Supported languages: Rust, Go, Python, Java, C/C++, C#, JavaScript, TypeScript, PHP, Perl, Ruby, Shell, Pascal, Scala, YAML, XML, JSON, HTML, TOML, Makefile, Dockerfile, INI, HCL, CMake, PowerShell, Batch, TCL, ReStructuredText, Velocity, Mustache, Protobuf, SVG, XSL."
 )]
 struct Args {
     #[arg(default_value = ".")]
@@ -128,8 +131,16 @@ fn read_file_lines_lossy(file_path: &Path) -> io::Result<Vec<String>> {
 /// Identify the language based on the file extension (case-insensitive).
 fn get_language_from_extension(file_name: &str) -> Option<String> {
     let normalized = normalize_path_str(file_name);
-    // Extract extension and convert to lowercase for case-insensitive comparison.
-    let ext = normalized.rsplit('.').next()?.to_lowercase();
+    let lower_name = normalized.to_lowercase();
+    // Special filenames without (reliable) extensions
+    if lower_name.starts_with("dockerfile") { return Some("Dockerfile".to_string()); }
+    if lower_name == "makefile" || lower_name == "gnumakefile" || lower_name == "bsdmakefile" {
+        return Some("Makefile".to_string());
+    }
+    if lower_name == "cmakelists.txt" { return Some("CMake".to_string()); }
+    // Extract extension (if any) and convert to lowercase for case-insensitive comparison.
+    let ext_opt = normalized.rsplit('.').nth(1).map(|_| normalized.rsplit('.').next().unwrap().to_lowercase());
+    let ext = match ext_opt { Some(e) => e, None => return None };
     match ext.as_str() {
         "rs"   => Some("Rust".to_string()),
         "go"   => Some("Go".to_string()),
@@ -146,6 +157,39 @@ fn get_language_from_extension(file_name: &str) -> Option<String> {
         "rb"   => Some("Ruby".to_string()),
         "sh"   => Some("Shell".to_string()),
         "pas"  => Some("Pascal".to_string()),
+        // Newly supported extensions
+        "scala" | "sbt" => Some("Scala".to_string()),
+        "yaml" | "yml" => Some("YAML".to_string()),
+        "json" => Some("JSON".to_string()),
+        // XML family (but map SVG/XSL separately)
+        "xml" | "xsd" => Some("XML".to_string()),
+        "html" | "htm" | "xhtml" => Some("HTML".to_string()),
+        "toml" => Some("TOML".to_string()),
+        // Makefile variants
+        "mk" | "mak" => Some("Makefile".to_string()),
+        // INI-like
+        "ini" | "cfg" | "conf" | "properties" | "prop" => Some("INI".to_string()),
+        // HCL / Terraform
+        "hcl" | "tf" | "tfvars" => Some("HCL".to_string()),
+        // CMake modules
+        "cmake" => Some("CMake".to_string()),
+        // PowerShell
+        "ps1" | "psm1" | "psd1" => Some("PowerShell".to_string()),
+        // Batch / CMD
+        "bat" | "cmd" => Some("Batch".to_string()),
+        // TCL
+        "tcl" => Some("TCL".to_string()),
+        // ReStructuredText
+        "rst" | "rest" => Some("ReStructuredText".to_string()),
+        // Velocity templates
+        "vm" | "vtl" => Some("Velocity".to_string()),
+        // Mustache templates
+        "mustache" => Some("Mustache".to_string()),
+        // Protobuf
+        "proto" => Some("Protobuf".to_string()),
+        // SVG / XSL
+        "svg" => Some("SVG".to_string()),
+        "xsl" | "xslt" => Some("XSL".to_string()),
         _      => None,
     }
 }
@@ -174,6 +218,11 @@ fn truncate_start(s: &str, max_len: usize) -> String {
 
 /// Delegate counting to the appropriate parser based on file extension.
 fn count_lines_with_stats(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
+    // Inspect filename for special cases (Dockerfile*, Makefile variants)
+    let file_name_lower = file_path.file_name().and_then(|n| n.to_str()).map(|s| s.to_lowercase()).unwrap_or_default();
+    if file_name_lower.starts_with("dockerfile") { return count_dockerfile_lines(file_path); }
+    if file_name_lower == "makefile" || file_name_lower == "gnumakefile" || file_name_lower == "bsdmakefile" { return count_makefile_lines(file_path); }
+    if file_name_lower == "cmakelists.txt" { return count_cmake_lines(file_path); }
     // Get extension in lowercase for case-insensitive matching.
     let extension = file_path
         .extension()
@@ -191,6 +240,26 @@ fn count_lines_with_stats(file_path: &Path) -> io::Result<(LanguageStats, u64)> 
         "rb"  => count_ruby_lines(file_path),
         "sh"  => count_shell_lines(file_path),
         "pas" => count_pascal_lines(file_path),
+        // Newly supported languages
+        "scala" | "sbt" => count_c_style_lines(file_path),
+        "yaml" | "yml" => count_yaml_lines(file_path),
+        "json" => count_json_lines(file_path),
+        "xml" | "xsd" => count_xml_like_lines(file_path),
+        "html" | "htm" | "xhtml" => count_xml_like_lines(file_path),
+        "toml" => count_toml_lines(file_path),
+        "mk" | "mak" => count_makefile_lines(file_path),
+        "ini" | "cfg" | "conf" | "properties" | "prop" => count_ini_lines(file_path),
+        "hcl" | "tf" | "tfvars" => count_hcl_lines(file_path),
+        "cmake" => count_cmake_lines(file_path),
+        "ps1" | "psm1" | "psd1" => count_powershell_lines(file_path),
+        "bat" | "cmd" => count_batch_lines(file_path),
+        "tcl" => count_tcl_lines(file_path),
+        "rst" | "rest" => count_rst_lines(file_path),
+        "vm" | "vtl" => count_velocity_lines(file_path),
+        "mustache" => count_mustache_lines(file_path),
+        "proto" => count_c_style_lines(file_path),
+        "svg" => count_xml_like_lines(file_path),
+        "xsl" | "xslt" => count_xml_like_lines(file_path),
         _     => count_generic_lines(file_path),
     }
 }
@@ -635,6 +704,331 @@ fn count_pascal_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
     Ok((stats, total_lines))
 }
 
+/// Count lines for languages with hash-prefixed line comments only (e.g., YAML, TOML).
+fn count_hash_comment_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
+    let lines = read_file_lines_lossy(file_path)?;
+    let mut stats = LanguageStats::default();
+    let total_lines = lines.len() as u64;
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            stats.blank_lines += 1;
+        } else if trimmed.starts_with('#') {
+            stats.comment_lines += 1;
+        } else {
+            stats.code_lines += 1;
+        }
+    }
+    Ok((stats, total_lines))
+}
+
+fn count_yaml_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
+    count_hash_comment_lines(file_path)
+}
+
+fn count_toml_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
+    count_hash_comment_lines(file_path)
+}
+
+fn count_makefile_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
+    // Make treats leading '#' as comment. We don’t parse recipe semantics; keep it simple.
+    count_hash_comment_lines(file_path)
+}
+
+fn count_dockerfile_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
+    // Dockerfile uses '#' for comments; everything else is code or blank.
+    count_hash_comment_lines(file_path)
+}
+
+fn count_ini_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
+    let lines = read_file_lines_lossy(file_path)?;
+    let mut stats = LanguageStats::default();
+    let total_lines = lines.len() as u64;
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            stats.blank_lines += 1;
+        } else if trimmed.starts_with(';') || trimmed.starts_with('#') {
+            stats.comment_lines += 1;
+        } else {
+            stats.code_lines += 1;
+        }
+    }
+    Ok((stats, total_lines))
+}
+
+fn count_hcl_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
+    let lines = read_file_lines_lossy(file_path)?;
+    let mut stats = LanguageStats::default();
+    let mut in_block_comment = false;
+    let total_lines = lines.len() as u64;
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            stats.blank_lines += 1;
+            continue;
+        }
+        if in_block_comment {
+            stats.comment_lines += 1;
+            if let Some(pos) = trimmed.find("*/") {
+                in_block_comment = false;
+                let after = &trimmed[(pos + 2)..];
+                if !after.trim().is_empty() && !after.trim_start().starts_with("//") && !after.trim_start().starts_with('#') {
+                    stats.code_lines += 1;
+                }
+            }
+            continue;
+        }
+        // Line comments in HCL: // or # at line start
+        if trimmed.starts_with("//") || trimmed.starts_with('#') {
+            stats.comment_lines += 1;
+            continue;
+        }
+        // Block comments like C: /* ... */
+        if let Some(pos) = trimmed.find("/*") {
+            // Count code before comment
+            let before = &trimmed[..pos];
+            if !before.trim().is_empty() {
+                stats.code_lines += 1;
+            }
+            stats.comment_lines += 1;
+            if !trimmed[pos..].contains("*/") {
+                in_block_comment = true;
+            } else if let Some(end) = trimmed[pos..].find("*/") {
+                let after = &trimmed[(pos + end + 2)..];
+                if !after.trim().is_empty() && !after.trim_start().starts_with("//") && !after.trim_start().starts_with('#') {
+                    stats.code_lines += 1;
+                }
+            }
+            continue;
+        }
+        stats.code_lines += 1;
+    }
+    Ok((stats, total_lines))
+}
+
+fn count_rst_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
+    // Keep simple and in line with tokei: non-blank lines are code; no comments.
+    let lines = read_file_lines_lossy(file_path)?;
+    let mut stats = LanguageStats::default();
+    let total_lines = lines.len() as u64;
+    for line in lines {
+        if line.trim().is_empty() { stats.blank_lines += 1; } else { stats.code_lines += 1; }
+    }
+    Ok((stats, total_lines))
+}
+
+fn count_velocity_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
+    // Velocity: '##' line comments, '#* ... *#' block comments. Count code before/after markers.
+    let lines = read_file_lines_lossy(file_path)?;
+    let mut stats = LanguageStats::default();
+    let mut in_block = false;
+    let total_lines = lines.len() as u64;
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() { stats.blank_lines += 1; continue; }
+        if in_block {
+            stats.comment_lines += 1;
+            if let Some(pos) = trimmed.find("*#") {
+                in_block = false;
+                let after = &trimmed[(pos + 2)..];
+                if !after.trim().is_empty() && !after.trim_start().starts_with("##") { stats.code_lines += 1; }
+            }
+            continue;
+        }
+        if trimmed.starts_with("##") { stats.comment_lines += 1; continue; }
+        if let Some(pos) = trimmed.find("#*") {
+            let before = &trimmed[..pos];
+            if !before.trim().is_empty() { stats.code_lines += 1; }
+            stats.comment_lines += 1;
+            if !trimmed[pos..].contains("*#") { in_block = true; }
+            else if let Some(end) = trimmed[pos..].find("*#") {
+                let after = &trimmed[(pos + end + 2)..];
+                if !after.trim().is_empty() && !after.trim_start().starts_with("##") { stats.code_lines += 1; }
+            }
+            continue;
+        }
+        stats.code_lines += 1;
+    }
+    Ok((stats, total_lines))
+}
+
+fn count_mustache_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
+    // Mustache: comments start with '{{!' and end at the next '}}' (may cross lines).
+    let lines = read_file_lines_lossy(file_path)?;
+    let mut stats = LanguageStats::default();
+    let mut in_comment = false;
+    let total_lines = lines.len() as u64;
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() { stats.blank_lines += 1; continue; }
+        if in_comment {
+            stats.comment_lines += 1;
+            if let Some(pos) = trimmed.find("}}"){ // close
+                in_comment = false;
+                let after = &trimmed[(pos + 2)..];
+                if !after.trim().is_empty() { stats.code_lines += 1; }
+            }
+            continue;
+        }
+        if let Some(pos) = trimmed.find("{{!") {
+            let before = &trimmed[..pos];
+            if !before.trim().is_empty() { stats.code_lines += 1; }
+            stats.comment_lines += 1;
+            if !trimmed[pos..].contains("}}") { in_comment = true; }
+            else if let Some(end) = trimmed[pos..].find("}}") {
+                let after = &trimmed[(pos + end + 2)..];
+                if !after.trim().is_empty() { stats.code_lines += 1; }
+            }
+            continue;
+        }
+        stats.code_lines += 1;
+    }
+    Ok((stats, total_lines))
+}
+
+fn count_cmake_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
+    // CMake uses '#' for line comments; no block comment syntax.
+    count_hash_comment_lines(file_path)
+}
+
+fn count_powershell_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
+    // PowerShell supports '#' line comments and <# ... #> block comments.
+    let lines = read_file_lines_lossy(file_path)?;
+    let mut stats = LanguageStats::default();
+    let mut in_block_comment = false;
+    let total_lines = lines.len() as u64;
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() { stats.blank_lines += 1; continue; }
+        if in_block_comment {
+            stats.comment_lines += 1;
+            if let Some(pos) = trimmed.find("#>") {
+                in_block_comment = false;
+                let after = &trimmed[(pos + 2)..];
+                if !after.trim().is_empty() && !after.trim_start().starts_with('#') { stats.code_lines += 1; }
+            }
+            continue;
+        }
+        if let Some(pos) = trimmed.find("<#") {
+            // code before block comment
+            let before = &trimmed[..pos];
+            if !before.trim().is_empty() { stats.code_lines += 1; }
+            stats.comment_lines += 1;
+            if !trimmed[pos..].contains("#>") { in_block_comment = true; }
+            else if let Some(end) = trimmed[pos..].find("#>") {
+                let after = &trimmed[(pos + end + 2)..];
+                if !after.trim().is_empty() && !after.trim_start().starts_with('#') { stats.code_lines += 1; }
+            }
+            continue;
+        }
+        if trimmed.starts_with('#') { stats.comment_lines += 1; continue; }
+        stats.code_lines += 1;
+    }
+    Ok((stats, total_lines))
+}
+
+fn count_batch_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
+    // Batch files treat lines starting with REM (case-insensitive) or :: as comments.
+    let lines = read_file_lines_lossy(file_path)?;
+    let mut stats = LanguageStats::default();
+    let total_lines = lines.len() as u64;
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() { stats.blank_lines += 1; continue; }
+        let upper = trimmed.to_uppercase();
+        if upper.starts_with("REM ") || upper == "REM" || trimmed.starts_with("::") {
+            stats.comment_lines += 1;
+        } else {
+            stats.code_lines += 1;
+        }
+    }
+    Ok((stats, total_lines))
+}
+
+fn count_tcl_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
+    // TCL: '#' starts a comment; shebang on first line counts as code like shell.
+    let lines = read_file_lines_lossy(file_path)?;
+    let mut stats = LanguageStats::default();
+    let mut line_no = 0u64;
+    let total_lines = lines.len() as u64;
+    for line in lines {
+        line_no += 1;
+        let trimmed = line.trim();
+        if trimmed.is_empty() { stats.blank_lines += 1; continue; }
+        if trimmed.starts_with('#') {
+            if line_no == 1 && trimmed.starts_with("#!") { stats.code_lines += 1; }
+            else { stats.comment_lines += 1; }
+            continue;
+        }
+        stats.code_lines += 1;
+    }
+    Ok((stats, total_lines))
+}
+
+/// JSON has no comments per spec; count non-blank as code.
+fn count_json_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
+    let lines = read_file_lines_lossy(file_path)?;
+    let mut stats = LanguageStats::default();
+    let total_lines = lines.len() as u64;
+    for line in lines {
+        if line.trim().is_empty() {
+            stats.blank_lines += 1;
+        } else {
+            stats.code_lines += 1;
+        }
+    }
+    Ok((stats, total_lines))
+}
+
+/// Shared XML/HTML style comment handling for <!-- ... -->. Everything else non-blank is code.
+fn count_xml_like_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
+    let lines = read_file_lines_lossy(file_path)?;
+    let mut stats = LanguageStats::default();
+    let mut in_comment = false;
+    let total_lines = lines.len() as u64;
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            stats.blank_lines += 1;
+            continue;
+        }
+        if in_comment {
+            stats.comment_lines += 1;
+            if let Some(pos) = trimmed.find("-->") {
+                in_comment = false;
+                // Anything after the closing marker counts as code if not blank
+                let after = &trimmed[(pos + 3)..];
+                if !after.trim().is_empty() {
+                    stats.code_lines += 1;
+                }
+            }
+            continue;
+        }
+        if let Some(pos) = trimmed.find("<!--") {
+            // Count potential code before the comment start
+            let before = &trimmed[..pos];
+            if !before.trim().is_empty() {
+                stats.code_lines += 1;
+            }
+            stats.comment_lines += 1;
+            if !trimmed[pos..].contains("-->") {
+                in_comment = true;
+            } else if let Some(end) = trimmed[pos..].find("-->") {
+                // Check for trailing code after closing marker on same line
+                let after = &trimmed[(pos + end + 3)..];
+                if !after.trim().is_empty() {
+                    stats.code_lines += 1;
+                }
+            }
+            continue;
+        }
+        // Not in comment and no comment delimiter on this line -> code
+        stats.code_lines += 1;
+    }
+    Ok((stats, total_lines))
+}
+
 fn scan_directory(
     path: &Path, 
     args: &Args,
@@ -961,5 +1355,282 @@ mod tests {
         // The truncated version should contain the important ending portion.
         let expected_ending: String = long_str.chars().rev().take(DIR_WIDTH - 3).collect::<Vec<_>>().into_iter().rev().collect();
         assert!(truncated.ends_with(&expected_ending));
+    }
+
+    #[test]
+    fn test_yaml_line_counting() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            &temp_dir.path(),
+            "test.yaml",
+            "# comment\nkey: value\n\nlist:\n  - item # inline text after value (treated as code)\n",
+        )?;
+        let (stats, _total_lines) = count_yaml_lines(&temp_dir.path().join("test.yaml"))?;
+        assert_eq!(stats.code_lines, 3); // key, list:, item
+        assert_eq!(stats.comment_lines, 1);
+        assert_eq!(stats.blank_lines, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_toml_line_counting() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            &temp_dir.path(),
+            "Cargo.toml",
+            "# comment\n[package]\nname = 'demo'\n\n[dependencies]\n",
+        )?;
+        let (stats, _total_lines) = count_toml_lines(&temp_dir.path().join("Cargo.toml"))?;
+        assert_eq!(stats.code_lines, 3);
+        assert_eq!(stats.comment_lines, 1);
+        assert_eq!(stats.blank_lines, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_json_line_counting() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            &temp_dir.path(),
+            "data.json",
+            "{\n  \"k\": 1,\n  \"arr\": [1,2]\n}\n\n",
+        )?;
+        let (stats, _total_lines) = count_json_lines(&temp_dir.path().join("data.json"))?;
+        assert_eq!(stats.code_lines, 4);
+        assert_eq!(stats.comment_lines, 0);
+        assert_eq!(stats.blank_lines, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_xml_line_counting() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            &temp_dir.path(),
+            "data.xml",
+            "<root>\n<!-- c1 -->\n<!--\n block\n-->\n<child/>\n</root>\n",
+        )?;
+        let (stats, _total_lines) = count_xml_like_lines(&temp_dir.path().join("data.xml"))?;
+        assert!(stats.code_lines >= 3);
+        assert!(stats.comment_lines >= 3);
+        assert_eq!(stats.blank_lines, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_html_line_counting() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            &temp_dir.path(),
+            "index.html",
+            "<html>\n<body>\n<!-- banner -->\n<div>hi</div>\n<!--\n multi\n-->\n</body>\n</html>\n",
+        )?;
+        let (stats, _total_lines) = count_xml_like_lines(&temp_dir.path().join("index.html"))?;
+        assert!(stats.code_lines >= 5); // <html>, <body>, <div>, </body>, </html>
+        assert!(stats.comment_lines >= 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_makefile_line_counting() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            &temp_dir.path(),
+            "Makefile",
+            "# comment\n\nall:\n\t@echo hello # inline\n",
+        )?;
+        let (stats, _total_lines) = count_makefile_lines(&temp_dir.path().join("Makefile"))?;
+        assert_eq!(stats.code_lines, 2); // all:, recipe line
+        assert_eq!(stats.comment_lines, 1);
+        assert_eq!(stats.blank_lines, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_makefile_extension_mapping() {
+        assert_eq!(get_language_from_extension("rules.mk"), Some("Makefile".to_string()));
+        assert_eq!(get_language_from_extension("GNUmakefile"), Some("Makefile".to_string()));
+    }
+
+    #[test]
+    fn test_dockerfile_line_counting() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            &temp_dir.path(),
+            "Dockerfile",
+            "# comment\nFROM alpine\nRUN echo hi\n",
+        )?;
+        let (stats, _total_lines) = count_dockerfile_lines(&temp_dir.path().join("Dockerfile"))?;
+        assert_eq!(stats.code_lines, 2);
+        assert_eq!(stats.comment_lines, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_ini_line_counting() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            &temp_dir.path(),
+            "config.ini",
+            "; top comment\n# another\n[core]\nname = demo\n\n",
+        )?;
+        let (stats, _total_lines) = count_ini_lines(&temp_dir.path().join("config.ini"))?;
+        assert_eq!(stats.code_lines, 2);
+        assert_eq!(stats.comment_lines, 2);
+        assert_eq!(stats.blank_lines, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_hcl_line_counting() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            &temp_dir.path(),
+            "main.tf",
+            "# comment\n// also comment\nresource \"x\" \"y\" {\n  a = 1 /* inline */\n}\n/*\nblock\n*/\n",
+        )?;
+        let (stats, _total_lines) = count_hcl_lines(&temp_dir.path().join("main.tf"))?;
+        assert!(stats.code_lines >= 3);
+        assert!(stats.comment_lines >= 4);
+        Ok(())
+    }
+
+    #[test]
+    fn test_cmake_line_counting() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            &temp_dir.path(),
+            "CMakeLists.txt",
+            "# top\ncmake_minimum_required(VERSION 3.25)\nproject(demo)\n# end\n",
+        )?;
+        let (stats, _total_lines) = count_cmake_lines(&temp_dir.path().join("CMakeLists.txt"))?;
+        assert_eq!(stats.code_lines, 2);
+        assert_eq!(stats.comment_lines, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_powershell_line_counting() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            &temp_dir.path(),
+            "script.ps1",
+            "# line\nWrite-Host 'hi'\n<# block\ncomment #> Write-Host 'after'\n",
+        )?;
+        let (stats, _total_lines) = count_powershell_lines(&temp_dir.path().join("script.ps1"))?;
+        assert!(stats.code_lines >= 2);
+        assert!(stats.comment_lines >= 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_batch_line_counting() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            &temp_dir.path(),
+            "run.bat",
+            "REM header\n:: also comment\n@echo on\nset X=1\n",
+        )?;
+        let (stats, _total_lines) = count_batch_lines(&temp_dir.path().join("run.bat"))?;
+        assert_eq!(stats.comment_lines, 2);
+        assert_eq!(stats.code_lines, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_tcl_line_counting() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            &temp_dir.path(),
+            "prog.tcl",
+            "#! /usr/bin/env tclsh\n# comment\nputs \"hello\"\n",
+        )?;
+        let (stats, _total_lines) = count_tcl_lines(&temp_dir.path().join("prog.tcl"))?;
+        assert_eq!(stats.code_lines, 2); // shebang + puts
+        assert_eq!(stats.comment_lines, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_rst_line_counting() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            &temp_dir.path(),
+            "doc.rst",
+            "Title\n=====\n\n.. comment\n\nParagraph text.\n",
+        )?;
+        let (stats, _total_lines) = count_rst_lines(&temp_dir.path().join("doc.rst"))?;
+        assert_eq!(stats.blank_lines, 2);
+        assert_eq!(stats.comment_lines, 0);
+        assert_eq!(stats.code_lines, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn test_velocity_line_counting() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            &temp_dir.path(),
+            "template.vm",
+            "## line comment\nHello #* block *# World\n#* multi\nline *#\n",
+        )?;
+        let (stats, _total_lines) = count_velocity_lines(&temp_dir.path().join("template.vm"))?;
+        assert!(stats.code_lines >= 2);
+        assert!(stats.comment_lines >= 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_mustache_line_counting() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            &temp_dir.path(),
+            "view.mustache",
+            "{{! top }}\nHello {{name}}\n{{! multi\n line }}\n",
+        )?;
+        let (stats, _total_lines) = count_mustache_lines(&temp_dir.path().join("view.mustache"))?;
+        assert!(stats.code_lines >= 1);
+        assert!(stats.comment_lines >= 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_proto_line_counting() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            &temp_dir.path(),
+            "msg.proto",
+            "// comment\n/* block */\nsyntax = \"proto3\";\n",
+        )?;
+        let (stats, _total_lines) = count_c_style_lines(&temp_dir.path().join("msg.proto"))?;
+        assert_eq!(stats.code_lines, 1);
+        assert_eq!(stats.comment_lines, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_svg_xsl_line_counting() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(&temp_dir.path(), "pic.svg", "<svg><!-- c --><g/></svg>\n")?;
+        create_test_file(&temp_dir.path(), "sheet.xsl", "<xsl:stylesheet><!-- c --></xsl:stylesheet>\n")?;
+        let (svg_stats, _) = count_xml_like_lines(&temp_dir.path().join("pic.svg"))?;
+        let (xsl_stats, _) = count_xml_like_lines(&temp_dir.path().join("sheet.xsl"))?;
+        assert!(svg_stats.code_lines >= 1 && svg_stats.comment_lines >= 1);
+        assert!(xsl_stats.code_lines >= 1 && xsl_stats.comment_lines >= 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_scala_is_c_style() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            &temp_dir.path(),
+            "Main.scala",
+            "object Main {\n// comment\n/* block */\nval x = 1\n}\n",
+        )?;
+        let (stats, _total_lines) = count_c_style_lines(&temp_dir.path().join("Main.scala"))?;
+        assert_eq!(stats.code_lines, 3);
+        assert_eq!(stats.comment_lines, 2);
+        Ok(())
     }
 }
