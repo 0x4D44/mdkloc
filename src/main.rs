@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 
 // Fixed width for the directory column.
 const DIR_WIDTH: usize = 40;
+const LANG_WIDTH: usize = 16;
 
 // Performance metrics structure
 #[derive(Debug)]
@@ -66,7 +67,7 @@ struct Args {
     filespec: Option<String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 struct LanguageStats {
     code_lines: u64,
     comment_lines: u64,
@@ -76,6 +77,31 @@ struct LanguageStats {
 #[derive(Debug, Default)]
 struct DirectoryStats {
     language_stats: HashMap<String, (u64, LanguageStats)>, // (file_count, stats) per language
+}
+
+fn normalize_stats(mut stats: LanguageStats, total_lines: u64) -> LanguageStats {
+    if total_lines == 0 {
+        return stats;
+    }
+    let sum = stats.code_lines + stats.comment_lines + stats.blank_lines;
+    if sum > total_lines {
+        let mut overlap = sum - total_lines;
+        let comment_reduce = stats.comment_lines.min(overlap);
+        stats.comment_lines -= comment_reduce;
+        overlap -= comment_reduce;
+        if overlap > 0 {
+            let code_reduce = stats.code_lines.min(overlap);
+            stats.code_lines -= code_reduce;
+            overlap -= code_reduce;
+        }
+        if overlap > 0 {
+            let blank_reduce = stats.blank_lines.min(overlap);
+            stats.blank_lines -= blank_reduce;
+        }
+    } else if sum < total_lines && sum > 0 {
+        stats.blank_lines += total_lines - sum;
+    }
+    stats
 }
 
 impl PerformanceMetrics {
@@ -122,18 +148,18 @@ impl PerformanceMetrics {
 
         println!("\n\n{}", "Performance Summary:".blue().bold());
         println!(
-            "Total time: {:.2} seconds",
-            elapsed.to_string().bright_yellow()
+            "Total time: {} seconds",
+            format!("{:.2}", elapsed).bright_yellow()
         );
         println!(
-            "Files processed: {} ({:.1} files/sec)",
+            "Files processed: {} ({})",
             files.to_string().bright_yellow(),
-            (files as f64 / elapsed).to_string().bright_yellow()
+            format!("{:.1} files/sec", safe_rate(files, elapsed)).bright_yellow()
         );
         println!(
-            "Lines processed: {} ({:.1} lines/sec)",
+            "Lines processed: {} ({})",
             lines.to_string().bright_yellow(),
-            (lines as f64 / elapsed).to_string().bright_yellow()
+            format!("{:.1} lines/sec", safe_rate(lines, elapsed)).bright_yellow()
         );
     }
 }
@@ -282,6 +308,22 @@ fn truncate_start(s: &str, max_len: usize) -> String {
         let skip_count = char_count - (max_len - 3);
         let truncated: String = s.chars().skip(skip_count).collect();
         format!("...{}", truncated)
+    }
+}
+
+fn safe_rate(value: u64, elapsed_secs: f64) -> f64 {
+    if elapsed_secs <= f64::EPSILON {
+        0.0
+    } else {
+        value as f64 / elapsed_secs
+    }
+}
+
+fn safe_percentage(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        (numerator as f64 / denominator as f64) * 100.0
     }
 }
 
@@ -1648,17 +1690,17 @@ fn scan_directory(
             .and_then(|n| n.to_str())
             .and_then(get_language_from_extension)
         {
-            // Safely handle parent path without unwrapping
             let dir_path = match path.parent() {
                 Some(parent) => parent.to_path_buf(),
                 None => PathBuf::from(""),
             };
 
-            if let Ok((ref file_stats, total_lines)) = count_lines_with_stats(path) {
+            if let Ok((file_stats, total_lines)) = count_lines_with_stats(path) {
+                let file_stats = normalize_stats(file_stats, total_lines);
                 metrics.update(total_lines);
                 let total_line_kinds =
                     file_stats.code_lines + file_stats.comment_lines + file_stats.blank_lines;
-                if total_line_kinds > 0 {
+                if total_line_kinds > 0 || total_lines == 0 {
                     let dir_stats = stats.entry(dir_path).or_default();
                     let (count, lang_stats) = dir_stats
                         .language_stats
@@ -1712,12 +1754,13 @@ fn scan_directory(
                             };
 
                             match count_lines_with_stats(&path) {
-                                Ok((ref file_stats, total_lines)) => {
+                                Ok((file_stats, total_lines)) => {
+                                    let file_stats = normalize_stats(file_stats, total_lines);
                                     metrics.update(total_lines);
                                     let total_line_kinds = file_stats.code_lines
                                         + file_stats.comment_lines
                                         + file_stats.blank_lines;
-                                    if total_line_kinds > 0 {
+                                    if total_line_kinds > 0 || total_lines == 0 {
                                         let dir_stats = stats.entry(dir_path).or_default();
                                         let (count, lang_stats) = dir_stats
                                             .language_stats
@@ -1808,12 +1851,13 @@ fn scan_directory(
                     };
 
                     match count_lines_with_stats(&entry.path()) {
-                        Ok((ref file_stats, total_lines)) => {
+                        Ok((file_stats, total_lines)) => {
+                            let file_stats = normalize_stats(file_stats, total_lines);
                             metrics.update(total_lines);
                             let total_line_kinds = file_stats.code_lines
                                 + file_stats.comment_lines
                                 + file_stats.blank_lines;
-                            if total_line_kinds > 0 {
+                            if total_line_kinds > 0 || total_lines == 0 {
                                 let dir_stats = stats.entry(dir_path).or_default();
                                 let (count, lang_stats) = dir_stats
                                     .language_stats
@@ -1853,8 +1897,14 @@ fn format_language_stats_line(
     stats: &LanguageStats,
 ) -> String {
     format!(
-        "{:<40} {:<12} {:>8} {:>10} {:>10} {:>10}",
-        prefix, lang, file_count, stats.code_lines, stats.comment_lines, stats.blank_lines
+        "{:<40} {:<width$} {:>8} {:>10} {:>10} {:>10}",
+        prefix,
+        lang,
+        file_count,
+        stats.code_lines,
+        stats.comment_lines,
+        stats.blank_lines,
+        width = LANG_WIDTH
     )
 }
 
@@ -1898,6 +1948,8 @@ fn main() -> io::Result<()> {
         &mut error_count,
     )?;
     metrics.print_final_stats();
+    let files_processed = metrics.files_processed.load(Ordering::Relaxed);
+    let lines_processed = metrics.lines_processed.load(Ordering::Relaxed);
 
     // Print detailed analysis with fixed-width directory field.
     let mut total_by_language: HashMap<String, (u64, LanguageStats)> = HashMap::new();
@@ -1907,8 +1959,14 @@ fn main() -> io::Result<()> {
     println!("\n\nDetailed source code analysis:");
     println!("{}", "-".repeat(100));
     println!(
-        "{:<40} {:<12} {:>8} {:>10} {:>10} {:>10}",
-        "Directory", "Language", "Files", "Code", "Comments", "Blank"
+        "{:<40} {:<width$} {:>8} {:>10} {:>10} {:>10}",
+        "Directory",
+        "Language",
+        "Files",
+        "Code",
+        "Comments",
+        "Blank",
+        width = LANG_WIDTH
     );
     println!("{}", "-".repeat(100));
 
@@ -1950,47 +2008,49 @@ fn main() -> io::Result<()> {
     }
 
     let mut grand_total = LanguageStats::default();
-    let mut total_files = 0;
 
-    for (_, (files, stats)) in total_by_language.iter() {
-        total_files += files;
+    for (_, (_files, stats)) in total_by_language.iter() {
         grand_total.code_lines += stats.code_lines;
         grand_total.comment_lines += stats.comment_lines;
         grand_total.blank_lines += stats.blank_lines;
     }
 
-    let total_lines = grand_total.code_lines + grand_total.comment_lines + grand_total.blank_lines;
-
-    if total_lines > 0 {
+    if files_processed > 0 || lines_processed > 0 {
         println!("\n{}", "Overall Summary:".blue().bold());
         println!(
             "Total files processed: {}",
-            total_files.to_string().bright_yellow()
+            files_processed.to_string().bright_yellow()
         );
         println!(
             "Total lines processed: {}",
-            total_lines.to_string().bright_yellow()
+            lines_processed.to_string().bright_yellow()
         );
         println!(
-            "Code lines:     {} ({:.1}%)",
+            "Code lines:     {} ({})",
             grand_total.code_lines.to_string().bright_yellow(),
-            ((grand_total.code_lines as f64 / total_lines as f64) * 100.0)
-                .to_string()
-                .bright_yellow()
+            format!(
+                "{:.1}%",
+                safe_percentage(grand_total.code_lines, lines_processed)
+            )
+            .bright_yellow()
         );
         println!(
-            "Comment lines:  {} ({:.1}%)",
+            "Comment lines:  {} ({})",
             grand_total.comment_lines.to_string().bright_yellow(),
-            ((grand_total.comment_lines as f64 / total_lines as f64) * 100.0)
-                .to_string()
-                .bright_yellow()
+            format!(
+                "{:.1}%",
+                safe_percentage(grand_total.comment_lines, lines_processed)
+            )
+            .bright_yellow()
         );
         println!(
-            "Blank lines:    {} ({:.1}%)",
+            "Blank lines:    {} ({})",
             grand_total.blank_lines.to_string().bright_yellow(),
-            ((grand_total.blank_lines as f64 / total_lines as f64) * 100.0)
-                .to_string()
-                .bright_yellow()
+            format!(
+                "{:.1}%",
+                safe_percentage(grand_total.blank_lines, lines_processed)
+            )
+            .bright_yellow()
         );
 
         if error_count > 0 {
@@ -2033,6 +2093,56 @@ mod tests {
         let mut file = File::create(path)?;
         write!(file, "{}", content)?;
         Ok(())
+    }
+
+    #[test]
+    fn test_safe_rate_handles_zero_elapsed() {
+        assert_eq!(safe_rate(100, 0.0), 0.0);
+    }
+
+    #[test]
+    fn test_safe_rate_precision() {
+        let rate = safe_rate(4850468, 10.0);
+        assert!((rate - 485046.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_safe_percentage_handles_zero_denominator() {
+        assert_eq!(safe_percentage(42, 0), 0.0);
+    }
+
+    #[test]
+    fn test_safe_percentage_precision() {
+        let pct = safe_percentage(375, 1000);
+        assert!((pct - 37.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_normalize_stats_eliminates_overlap() {
+        let stats = LanguageStats {
+            code_lines: 2,
+            comment_lines: 2,
+            blank_lines: 0,
+        };
+        let normalized = normalize_stats(stats, 3);
+        assert_eq!(
+            normalized.code_lines + normalized.comment_lines + normalized.blank_lines,
+            3
+        );
+        assert!(normalized.comment_lines < stats.comment_lines);
+    }
+
+    #[test]
+    fn test_normalize_stats_does_not_inflate_when_zero_sum() {
+        let stats = LanguageStats {
+            code_lines: 0,
+            comment_lines: 0,
+            blank_lines: 0,
+        };
+        let normalized = normalize_stats(stats, 5);
+        assert_eq!(normalized.code_lines, 0);
+        assert_eq!(normalized.comment_lines, 0);
+        assert_eq!(normalized.blank_lines, 0);
     }
 
     #[test]
@@ -2675,6 +2785,96 @@ mod tests {
     }
 
     #[test]
+    fn test_empty_file_counts_towards_totals() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        create_test_file(root, "empty.rs", "")?;
+        let args = test_args();
+        let mut metrics = test_metrics();
+        let mut entries_count = 0usize;
+        let mut error_count = 0usize;
+        let stats = scan_directory(
+            root,
+            &args,
+            root,
+            &mut metrics,
+            0,
+            &mut entries_count,
+            &mut error_count,
+        )?;
+        let dir_stats = stats
+            .get(root)
+            .expect("expected root directory stats for empty file");
+        let (file_count, lang_stats) = dir_stats
+            .language_stats
+            .get("Rust")
+            .expect("expected Rust entry for empty file");
+        assert_eq!(*file_count, 1);
+        assert_eq!(lang_stats.code_lines, 0);
+        assert_eq!(lang_stats.comment_lines, 0);
+        assert_eq!(lang_stats.blank_lines, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_mixed_code_and_comment_counts_once() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "mixed.rs",
+            "fn main() { println!(\"hi\"); } // greet\n/* block */\n",
+        )?;
+        let (raw_stats, total_lines) =
+            count_lines_with_stats(temp_dir.path().join("mixed.rs").as_path())?;
+        let stats = normalize_stats(raw_stats, total_lines);
+        assert_eq!(total_lines, 2);
+        assert_eq!(
+            stats.code_lines + stats.comment_lines + stats.blank_lines,
+            total_lines
+        );
+        assert!(stats.code_lines >= 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_directory_sums_match_metrics() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        create_test_file(
+            root,
+            "mixed.rs",
+            "fn main() { println!(\"hi\"); } // greet\n/* block */\n",
+        )?;
+        create_test_file(root, "script.py", "print('hi')  # greet\n\n")?;
+        let args = test_args();
+        let mut metrics = test_metrics();
+        let mut entries_count = 0usize;
+        let mut error_count = 0usize;
+        let stats = scan_directory(
+            root,
+            &args,
+            root,
+            &mut metrics,
+            0,
+            &mut entries_count,
+            &mut error_count,
+        )?;
+        assert_eq!(error_count, 0);
+        let mut aggregated = LanguageStats::default();
+        for dir_stats in stats.values() {
+            for (_, (_, lang_stats)) in &dir_stats.language_stats {
+                aggregated.code_lines += lang_stats.code_lines;
+                aggregated.comment_lines += lang_stats.comment_lines;
+                aggregated.blank_lines += lang_stats.blank_lines;
+            }
+        }
+        let sum = aggregated.code_lines + aggregated.comment_lines + aggregated.blank_lines;
+        let lines_processed = metrics.lines_processed.load(Ordering::Relaxed);
+        assert_eq!(sum, lines_processed);
+        Ok(())
+    }
+
+    #[test]
     fn test_algol_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
@@ -2771,9 +2971,9 @@ mod tests {
         // No ANSI escape
         assert!(!line.contains('\u{1b}'));
         // Check widths (basic sanity)
-        // prefix (<=40 left), space, lang (<=12), space, 8, space, 10, space, 10, space, 10
-        // Total minimum length should be >= 40+1+12+1+8+1+10+1+10+1+10 = 94
-        assert!(line.len() >= 94);
+        // prefix (<=40 left), space, lang (<=16), space, 8, space, 10, space, 10, space, 10
+        // Total minimum length should be >= 40+1+16+1+8+1+10+1+10+1+10 = 99
+        assert!(line.len() >= 99);
     }
 
     #[test]
