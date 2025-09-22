@@ -2862,7 +2862,7 @@ mod tests {
         assert_eq!(error_count, 0);
         let mut aggregated = LanguageStats::default();
         for dir_stats in stats.values() {
-            for (_, (_, lang_stats)) in &dir_stats.language_stats {
+            for (_, lang_stats) in dir_stats.language_stats.values() {
                 aggregated.code_lines += lang_stats.code_lines;
                 aggregated.comment_lines += lang_stats.comment_lines;
                 aggregated.blank_lines += lang_stats.blank_lines;
