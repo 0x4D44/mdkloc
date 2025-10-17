@@ -2,7 +2,7 @@
 
 A fast, multi-language lines-of-code analyzer written in Rust. mdkloc reports per-language code, comment, and blank line counts by directory and totals. It aims to align with common tools (like tokei) while remaining simple and fast.
 
-## What’s New in 2.0.0
+## What's New in 2.0.0
 
 - Major language expansion: Scala, YAML, JSON, XML (incl. SVG/XSL), HTML, TOML, CMake, Dockerfile, Makefile, INI, HCL/Terraform, ReStructuredText, Velocity, Mustache, Protobuf, plus classic languages: Algol, COBOL, Fortran, x86 Assembly, DCL (OpenVMS), and IPLAN (PSS/E).
 - Special-filename detection: Dockerfile, Makefile, CMakeLists.txt.
@@ -166,6 +166,23 @@ Run the test suite:
 cargo test
 ```
 
+Integration tests that exercise the compiled binary live under `tests/`. Run them directly with:
+
+```bash
+cargo test --test cli_smoke
+```
+
+Before opening a pull request, run the repository checklist:
+
+```bash
+cargo fmt
+cargo clippy -- -D warnings
+cargo test
+cargo llvm-cov --workspace --summary-only
+```
+
+See `docs/2025.10.17 - Coverage Recovery Plan.md` for the latest coverage targets and follow-up actions.
+
 The project includes comprehensive tests covering:
 - Directory scanning
 - Line counting for each supported language
@@ -180,5 +197,5 @@ Licensed under the terms in LICENSE.
 ---
 
 Notes
-- Some legacy/templating languages are handled with practical heuristics (e.g., Algol COMMENT…; COBOL column 7; Fortran fixed/free forms). If you have dialect-specific files, open an issue with examples and we can refine the counters.
+- Some legacy/templating languages are handled with practical heuristics (e.g., Algol COMMENT...; COBOL column 7; Fortran fixed/free forms). If you have dialect-specific files, open an issue with examples and we can refine the counters.
 - To compare with tokei, use the Code column in both tools and ensure you scan the same directory set and language filters.

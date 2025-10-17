@@ -2635,6 +2635,94 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_directory_warns_on_max_depth() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        let level1 = root.join("level1");
+        let level2 = level1.join("level2");
+        fs::create_dir(&level1)?;
+        fs::create_dir(&level2)?;
+        create_test_file(root, "root_file.rs", "fn root_file() {}\n")?;
+        create_test_file(&level1, "child.rs", "fn child() {}\n")?;
+        create_test_file(&level2, "nested.rs", "fn nested() {}\n")?;
+
+        let mut args = test_args();
+        args.max_depth = 0;
+
+        let mut metrics = test_metrics();
+        let mut entries_count = 0usize;
+        let mut error_count = 0usize;
+        let stats = scan_directory(
+            root,
+            &args,
+            root,
+            &mut metrics,
+            0,
+            &mut entries_count,
+            &mut error_count,
+        )?;
+
+        let root_key = fs::canonicalize(root)?;
+        let level1_key = fs::canonicalize(&level1)?;
+        assert!(
+            stats.contains_key(&root_key),
+            "root stats should still exist"
+        );
+        assert!(
+            !stats.contains_key(&level1_key),
+            "children beyond max_depth should be skipped"
+        );
+        assert_eq!(
+            error_count, 1,
+            "exceeding max_depth should log a warning/error"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_directory_auto_ignores_special_dirs() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        let git_dir = root.join(".git");
+        let node_modules = root.join("node_modules");
+        fs::create_dir(&git_dir)?;
+        fs::create_dir(&node_modules)?;
+        create_test_file(root, "main.rs", "fn main() {}\n")?;
+        create_test_file(&git_dir, "ignored.rs", "fn ignored() {}\n")?;
+        create_test_file(&node_modules, "ignored.js", "console.log('ignored');\n")?;
+
+        let args = test_args();
+        let mut metrics = test_metrics();
+        let mut entries_count = 0usize;
+        let mut error_count = 0usize;
+        let stats = scan_directory(
+            root,
+            &args,
+            root,
+            &mut metrics,
+            0,
+            &mut entries_count,
+            &mut error_count,
+        )?;
+
+        let root_key = fs::canonicalize(root)?;
+        assert!(
+            stats.contains_key(&root_key),
+            "root stats should exist when scanning root"
+        );
+        assert!(
+            !stats.contains_key(&fs::canonicalize(&git_dir)?),
+            ".git directory should be auto-ignored"
+        );
+        assert!(
+            !stats.contains_key(&fs::canonicalize(&node_modules)?),
+            "node_modules directory should be auto-ignored"
+        );
+        assert_eq!(error_count, 0);
+        Ok(())
+    }
+
+    #[test]
     fn test_rust_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(temp_dir.path(), "test.rs", "fn main() {\n// Line comment\n/* Block comment */\n/// Doc comment\n//! Module comment\nprintln!(\"Hello\");\n}\n")?;
@@ -2670,6 +2758,20 @@ mod tests {
         let (stats, _total_lines) = count_rust_lines(temp_dir.path().join("mix.rs").as_path())?;
         assert_eq!(stats.code_lines, 3, "stats: {:?}", stats);
         assert_eq!(stats.comment_lines, 1, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_rust_multiline_block_close_followed_by_line_comment() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "multi.rs",
+            "fn tricky() {\n/* start\nstill comment */ // trailing\nlet x = 1;\n}\n",
+        )?;
+        let (stats, _total_lines) = count_rust_lines(temp_dir.path().join("multi.rs").as_path())?;
+        assert!(stats.code_lines >= 3, "stats: {:?}", stats);
+        assert!(stats.comment_lines >= 2, "stats: {:?}", stats);
         Ok(())
     }
 
@@ -2737,6 +2839,22 @@ fn decorated() {
             count_python_lines(temp_dir.path().join("inline_doc.py").as_path())?;
         assert_eq!(stats.code_lines, 2, "stats: {:?}", stats);
         assert_eq!(stats.comment_lines, 1, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_python_triple_quote_same_line_only_comment() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "inline_comment.py",
+            "def note():\n\"\"\"doc\"\"\" # trailing comment\npass\n",
+        )?;
+        let (stats, _total_lines) =
+            count_python_lines(temp_dir.path().join("inline_comment.py").as_path())?;
+        assert_eq!(stats.code_lines, 2, "stats: {:?}", stats);
+        assert_eq!(stats.comment_lines, 1, "stats: {:?}", stats);
+        assert_eq!(stats.blank_lines, 0, "stats: {:?}", stats);
         Ok(())
     }
 
@@ -2872,6 +2990,21 @@ fn decorated() {
             count_javascript_lines(temp_dir.path().join("mix.js").as_path())?;
         assert_eq!(stats.code_lines, 2, "stats: {:?}", stats);
         assert_eq!(stats.comment_lines, 2, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_javascript_block_close_followed_by_line_comment() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "close_line.js",
+            "function demo() {\n  const value = 1; /* block */ // trailing\n  return value;\n}\n",
+        )?;
+        let (stats, _total_lines) =
+            count_javascript_lines(temp_dir.path().join("close_line.js").as_path())?;
+        assert!(stats.code_lines >= 4, "stats: {:?}", stats);
+        assert!(stats.comment_lines <= 1, "stats: {:?}", stats);
         Ok(())
     }
 
@@ -3227,6 +3360,22 @@ fn decorated() {
     }
 
     #[test]
+    fn test_ini_mixed_comment_styles() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "settings.ini",
+            "name=value\n; comment\nvalue = other # trailing\n\n",
+        )?;
+        let (stats, _total_lines) =
+            count_ini_lines(temp_dir.path().join("settings.ini").as_path())?;
+        assert_eq!(stats.code_lines, 2, "stats: {:?}", stats);
+        assert_eq!(stats.comment_lines, 1, "stats: {:?}", stats);
+        assert_eq!(stats.blank_lines, 1, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
     fn test_hcl_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
@@ -3251,6 +3400,36 @@ fn decorated() {
         let (stats, _total_lines) = count_hcl_lines(temp_dir.path().join("inline.tf").as_path())?;
         assert!(stats.code_lines >= 3);
         assert!(stats.comment_lines >= 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_hcl_block_close_followed_by_hash_comment() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "trailing.tf",
+            "resource \"x\" \"y\" {\n  value = 1 /* block */ # trailing\n}\n",
+        )?;
+        let (stats, _total_lines) = count_hcl_lines(temp_dir.path().join("trailing.tf").as_path())?;
+        assert!(stats.code_lines >= 2, "stats: {:?}", stats);
+        assert!(stats.comment_lines >= 1, "stats: {:?}", stats);
+        assert_eq!(stats.blank_lines, 0, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_hcl_hash_comment_precedes_block() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "hash_first.tf",
+            "resource \"x\" \"y\" {\n  value = 1 # hash before block /* still comment */\n  another = 2\n}\n",
+        )?;
+        let (stats, _total_lines) =
+            count_hcl_lines(temp_dir.path().join("hash_first.tf").as_path())?;
+        assert!(stats.code_lines >= 3, "stats: {:?}", stats);
+        assert!(stats.comment_lines >= 1, "stats: {:?}", stats);
         Ok(())
     }
 
@@ -3441,6 +3620,21 @@ fn decorated() {
         let (stats, _total_lines) = count_c_style_lines(temp_dir.path().join("block.c").as_path())?;
         assert!(stats.code_lines >= 2);
         assert!(stats.comment_lines >= 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_cstyle_block_close_followed_by_line_comment() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "after_close.c",
+            "int main() {\n  int value = 0; /* block */ // trailing\n  return value;\n}\n",
+        )?;
+        let (stats, _total_lines) =
+            count_c_style_lines(temp_dir.path().join("after_close.c").as_path())?;
+        assert!(stats.code_lines >= 4, "stats: {:?}", stats);
+        assert!(stats.comment_lines >= 1, "stats: {:?}", stats);
         Ok(())
     }
 
@@ -4180,6 +4374,197 @@ fn decorated() {
         create_test_file(temp_dir.path(), "Makefile", "VAR=1 # inline\n")?;
         let (mk, _) = count_makefile_lines(temp_dir.path().join("Makefile").as_path())?;
         assert_eq!(mk.code_lines, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_hash_comment_mixed_lines() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "mixed.hash",
+            "# header\nvalue: 1\n\n  # indented\nnext: 2 # trailing\n",
+        )?;
+        let (stats, total) =
+            count_hash_comment_lines(temp_dir.path().join("mixed.hash").as_path())?;
+        assert_eq!(total, 5);
+        assert_eq!(stats.code_lines, 2, "stats: {:?}", stats);
+        assert_eq!(stats.comment_lines, 2, "stats: {:?}", stats);
+        assert_eq!(stats.blank_lines, 1, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_hash_comment_trailing_and_blank_mix() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "trailing.yaml",
+            "title: demo # inline\n\n# comment only\nvalue: 42\n",
+        )?;
+        let (stats, total) =
+            count_hash_comment_lines(temp_dir.path().join("trailing.yaml").as_path())?;
+        assert_eq!(total, 4);
+        assert_eq!(stats.code_lines, 2, "stats: {:?}", stats);
+        assert_eq!(stats.comment_lines, 1, "stats: {:?}", stats);
+        assert_eq!(stats.blank_lines, 1, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_hash_comment_comment_only() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(temp_dir.path(), "comments.hash", "# comment\n# another\n")?;
+        let (stats, total) =
+            count_hash_comment_lines(temp_dir.path().join("comments.hash").as_path())?;
+        assert_eq!(total, 2);
+        assert_eq!(stats.code_lines, 0);
+        assert_eq!(stats.comment_lines, 2);
+        assert_eq!(stats.blank_lines, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_hash_comment_blank_only() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(temp_dir.path(), "blank.hash", "\n\n")?;
+        let (stats, total) =
+            count_hash_comment_lines(temp_dir.path().join("blank.hash").as_path())?;
+        assert_eq!(total, 2);
+        assert_eq!(stats.code_lines, 0);
+        assert_eq!(stats.comment_lines, 0);
+        assert_eq!(stats.blank_lines, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_toml_blank_and_comment_mix() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "sample.toml",
+            "# header comment\n\nname = \"demo\" # trailing\n",
+        )?;
+        let (stats, total) =
+            count_toml_lines(temp_dir.path().join("sample.toml").as_path())?;
+        assert_eq!(total, 3);
+        assert_eq!(stats.code_lines, 1, "stats: {:?}", stats);
+        assert_eq!(stats.comment_lines, 1, "stats: {:?}", stats);
+        assert_eq!(stats.blank_lines, 1, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_toml_comment_only() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "comment.toml",
+            "# header\n# detail\n",
+        )?;
+        let (stats, total) =
+            count_toml_lines(temp_dir.path().join("comment.toml").as_path())?;
+        assert_eq!(total, 2);
+        assert_eq!(stats.code_lines, 0);
+        assert_eq!(stats.comment_lines, 2);
+        assert_eq!(stats.blank_lines, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_yaml_blank_and_comment_mix() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "sample.yaml",
+            "\n# comment line\nkey: value\n",
+        )?;
+        let (stats, total) =
+            count_yaml_lines(temp_dir.path().join("sample.yaml").as_path())?;
+        assert_eq!(total, 3);
+        assert_eq!(stats.code_lines, 1, "stats: {:?}", stats);
+        assert_eq!(stats.comment_lines, 1, "stats: {:?}", stats);
+        assert_eq!(stats.blank_lines, 1, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_yaml_comment_only() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "comment.yaml",
+            "# only comment\n# another\n",
+        )?;
+        let (stats, total) =
+            count_yaml_lines(temp_dir.path().join("comment.yaml").as_path())?;
+        assert_eq!(total, 2);
+        assert_eq!(stats.code_lines, 0);
+        assert_eq!(stats.comment_lines, 2);
+        assert_eq!(stats.blank_lines, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_makefile_comment_and_blank_mix() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "Makefile",
+            "# comment\n\nall:\n\t@echo done\n",
+        )?;
+        let (stats, total) =
+            count_makefile_lines(temp_dir.path().join("Makefile").as_path())?;
+        assert_eq!(total, 4);
+        assert_eq!(stats.code_lines, 2, "stats: {:?}", stats);
+        assert_eq!(stats.comment_lines, 1, "stats: {:?}", stats);
+        assert_eq!(stats.blank_lines, 1, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_makefile_comment_only() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(temp_dir.path(), "Makefile", "# comment\n# another\n")?;
+        let (stats, total) = count_makefile_lines(temp_dir.path().join("Makefile").as_path())?;
+        assert_eq!(total, 2);
+        assert_eq!(stats.code_lines, 0);
+        assert_eq!(stats.comment_lines, 2);
+        assert_eq!(stats.blank_lines, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_dockerfile_comment_and_blank_mix() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "Dockerfile",
+            "FROM alpine\n# comment\n\nRUN echo hi\n",
+        )?;
+        let (stats, total) =
+            count_dockerfile_lines(temp_dir.path().join("Dockerfile").as_path())?;
+        assert_eq!(total, 4);
+        assert_eq!(stats.code_lines, 2, "stats: {:?}", stats);
+        assert_eq!(stats.comment_lines, 1, "stats: {:?}", stats);
+        assert_eq!(stats.blank_lines, 1, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_dockerfile_comment_only() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "Dockerfile",
+            "# comment\n# another\n",
+        )?;
+        let (stats, total) =
+            count_dockerfile_lines(temp_dir.path().join("Dockerfile").as_path())?;
+        assert_eq!(total, 2);
+        assert_eq!(stats.code_lines, 0);
+        assert_eq!(stats.comment_lines, 2);
+        assert_eq!(stats.blank_lines, 0);
         Ok(())
     }
 

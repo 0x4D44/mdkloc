@@ -25,7 +25,7 @@
 - Validate behavioural changes with `cargo test` and, where relevant, targeted `cargo run` examples.
 
 ## Commit & Pull Request Guidelines
-- Write imperative, single-purpose commit messages (e.g., “Add support for TOML reports”).
+- Write imperative, single-purpose commit messages (e.g., "Add support for TOML reports").
 - Ensure every PR includes a short rationale, reproduction steps, and sample before/after CLI output.
 - Confirm `cargo fmt`, `cargo clippy -- -D warnings`, and `cargo test` all pass before requesting review.
 
