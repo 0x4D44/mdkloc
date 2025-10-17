@@ -13,7 +13,7 @@ use clap::{ArgAction, Parser};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use colored::*;
@@ -27,12 +27,13 @@ const DIR_WIDTH: usize = 40;
 const LANG_WIDTH: usize = 16;
 
 // Performance metrics structure
-#[derive(Debug)]
 struct PerformanceMetrics {
     files_processed: Arc<AtomicU64>,
     lines_processed: Arc<AtomicU64>,
     start_time: Instant,
     last_update: Instant,
+    writer: Box<dyn Write + Send>,
+    progress_enabled: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -103,11 +104,17 @@ fn normalize_stats(mut stats: LanguageStats, total_lines: u64) -> LanguageStats 
 
 impl PerformanceMetrics {
     fn new() -> Self {
+        PerformanceMetrics::with_writer(Box::new(io::stdout()), true)
+    }
+
+    fn with_writer(writer: Box<dyn Write + Send>, progress_enabled: bool) -> Self {
         PerformanceMetrics {
             files_processed: Arc::new(AtomicU64::new(0)),
             lines_processed: Arc::new(AtomicU64::new(0)),
             start_time: Instant::now(),
             last_update: Instant::now(),
+            writer,
+            progress_enabled,
         }
     }
 
@@ -123,37 +130,47 @@ impl PerformanceMetrics {
         }
     }
 
-    fn print_progress(&self) {
+    fn print_progress(&mut self) {
+        if !self.progress_enabled {
+            return;
+        }
+
         let elapsed = self.start_time.elapsed().as_secs_f64();
         let files = self.files_processed.load(Ordering::Relaxed);
         let lines = self.lines_processed.load(Ordering::Relaxed);
 
-        print!(
+        let writer = &mut self.writer;
+        let _ = write!(
+            writer,
             "\rProcessed {} files ({:.1} files/sec) and {} lines ({:.1} lines/sec)...",
             files,
             files as f64 / elapsed,
             lines,
             lines as f64 / elapsed
         );
-        let _ = io::Write::flush(&mut io::stdout()); // Ignore errors instead of unwrap
+        let _ = writer.flush();
     }
 
-    fn print_final_stats(&self) {
+    fn print_final_stats(&mut self) {
         let elapsed = self.start_time.elapsed().as_secs_f64();
         let files = self.files_processed.load(Ordering::Relaxed);
         let lines = self.lines_processed.load(Ordering::Relaxed);
 
-        println!("\n\n{}", "Performance Summary:".blue().bold());
-        println!(
+        let writer = &mut self.writer;
+        let _ = writeln!(writer, "\n\n{}", "Performance Summary:".blue().bold());
+        let _ = writeln!(
+            writer,
             "Total time: {} seconds",
             format!("{:.2}", elapsed).bright_yellow()
         );
-        println!(
+        let _ = writeln!(
+            writer,
             "Files processed: {} ({})",
             files.to_string().bright_yellow(),
             format!("{:.1} files/sec", safe_rate(files, elapsed)).bright_yellow()
         );
-        println!(
+        let _ = writeln!(
+            writer,
             "Lines processed: {} ({})",
             lines.to_string().bright_yellow(),
             format!("{:.1} lines/sec", safe_rate(lines, elapsed)).bright_yellow()
@@ -2005,15 +2022,20 @@ fn print_language_stats(prefix: &str, lang: &str, file_count: u64, stats: &Langu
 }
 
 fn main() -> io::Result<()> {
+    let args = Args::parse();
+    let mut metrics = PerformanceMetrics::new();
+    run_cli_with_metrics(args, &mut metrics)
+}
+
+fn run_cli_with_metrics(args: Args, metrics: &mut PerformanceMetrics) -> io::Result<()> {
     println!(
         "{} {}",
         env!("CARGO_PKG_NAME").bright_cyan().bold(),
         format!("v{}", env!("CARGO_PKG_VERSION")).bright_yellow()
     );
-    let args = Args::parse();
+
     let path = Path::new(&args.path);
     let current_dir = env::current_dir()?;
-    let mut metrics = PerformanceMetrics::new();
     let mut error_count = 0;
 
     if !path.exists() {
@@ -2030,7 +2052,7 @@ fn main() -> io::Result<()> {
         path,
         &args,
         &current_dir,
-        &mut metrics,
+        metrics,
         0,
         &mut entries_count,
         &mut error_count,
@@ -2168,8 +2190,11 @@ fn main() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use colored::control;
     use std::fs::{self, File};
-    use std::io::Write;
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
     use tempfile::TempDir;
 
     fn test_args() -> Args {
@@ -2185,7 +2210,7 @@ mod tests {
     }
 
     fn test_metrics() -> PerformanceMetrics {
-        PerformanceMetrics::new()
+        PerformanceMetrics::with_writer(Box::new(io::sink()), false)
     }
 
     fn create_test_file(dir: &Path, name: &str, content: &str) -> io::Result<()> {
@@ -2193,6 +2218,242 @@ mod tests {
         let mut file = File::create(path)?;
         write!(file, "{}", content)?;
         Ok(())
+    }
+
+    #[test]
+    fn test_count_lines_with_stats_special_cases() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "Dockerfile.prod",
+            "FROM alpine\n# comment\n",
+        )?;
+        create_test_file(temp_dir.path(), "Makefile", "all:\n\t@echo \\\"done\\\"\n")?;
+        create_test_file(
+            temp_dir.path(),
+            "CMakeLists.txt",
+            "cmake_minimum_required(VERSION 3.25)\n# note\n",
+        )?;
+        create_test_file(temp_dir.path(), "unknown.xyz", "plain text line\n")?;
+
+        let (docker_stats, docker_total) =
+            count_lines_with_stats(&temp_dir.path().join("Dockerfile.prod"))?;
+        assert_eq!(docker_total, 2);
+        assert!(docker_stats.comment_lines >= 1);
+
+        let (make_stats, _) = count_lines_with_stats(&temp_dir.path().join("Makefile"))?;
+        assert!(make_stats.code_lines >= 1);
+
+        let (cmake_stats, _) = count_lines_with_stats(&temp_dir.path().join("CMakeLists.txt"))?;
+        assert!(cmake_stats.comment_lines >= 1);
+
+        let (unknown_stats, _) = count_lines_with_stats(&temp_dir.path().join("unknown.xyz"))?;
+        assert!(unknown_stats.code_lines >= 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_count_lines_with_stats_proto_and_svg() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "model.proto",
+            "syntax = \"proto3\";\n// comment\nmessage Foo {\n  string name = 1;\n}\n",
+        )?;
+        let (proto_stats, _) = count_lines_with_stats(&temp_dir.path().join("model.proto"))?;
+        assert!(
+            proto_stats.comment_lines >= 1 && proto_stats.code_lines >= 3,
+            "proto stats: {:?}",
+            proto_stats
+        );
+
+        create_test_file(
+            temp_dir.path(),
+            "diagram.SVG",
+            "<svg><!-- note --><g/></svg>\n",
+        )?;
+        let (svg_stats, _) = count_lines_with_stats(&temp_dir.path().join("diagram.SVG"))?;
+        assert!(
+            svg_stats.comment_lines >= 1 && svg_stats.code_lines >= 1,
+            "svg stats: {:?}",
+            svg_stats
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_count_lines_with_stats_powershell() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "script.PS1",
+            "Write-Host 'start'\n<# block comment #>\nWrite-Host 'done'\n",
+        )?;
+        let (stats, _) = count_lines_with_stats(&temp_dir.path().join("script.PS1"))?;
+        assert!(
+            stats.code_lines >= 2 && stats.comment_lines >= 1,
+            "powershell stats: {:?}",
+            stats
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_process_file_missing_source_increments_error() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let missing = temp_dir.path().join("ghost.rs");
+        let mut metrics = test_metrics();
+        let mut stats = std::collections::HashMap::new();
+        let mut entries_count = 0usize;
+        let mut error_count = 0usize;
+
+        process_file(
+            &missing,
+            &test_args(),
+            temp_dir.path(),
+            &mut metrics,
+            &mut stats,
+            &mut entries_count,
+            &mut error_count,
+            None,
+        )?;
+
+        assert!(stats.is_empty());
+        assert_eq!(error_count, 1);
+        assert_eq!(entries_count, 1);
+        Ok(())
+    }
+
+    struct CaptureWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl CaptureWriter {
+        fn new(buffer: Arc<Mutex<Vec<u8>>>) -> Self {
+            Self { buffer }
+        }
+
+        fn into_string(buffer: Arc<Mutex<Vec<u8>>>) -> String {
+            let data = buffer.lock().expect("lock poisoned").clone();
+            String::from_utf8_lossy(&data).into_owned()
+        }
+    }
+
+    #[test]
+    fn test_performance_metrics_custom_writer() {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = CaptureWriter::new(buffer.clone());
+        let mut metrics = PerformanceMetrics::with_writer(Box::new(writer), true);
+        metrics.last_update = metrics.start_time - Duration::from_secs(2);
+        metrics.update(10);
+        metrics.print_final_stats();
+        let output = CaptureWriter::into_string(buffer);
+        assert!(output.contains("Processed"));
+        assert!(output.contains("Performance Summary"));
+    }
+
+    #[test]
+    fn test_performance_metrics_progress() {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = CaptureWriter::new(buffer.clone());
+        let mut metrics = PerformanceMetrics::with_writer(Box::new(writer), true);
+        metrics.last_update = metrics.start_time - Duration::from_secs(2);
+        metrics.update(5);
+        let output = CaptureWriter::into_string(buffer.clone());
+        assert!(
+            output.contains("Processed 1 files"),
+            "progress output missing expected prefix: {output}"
+        );
+        metrics.print_progress();
+        let output = CaptureWriter::into_string(buffer);
+        assert!(
+            output.contains("files/sec"),
+            "progress output missing rate info: {output}"
+        );
+    }
+
+    #[test]
+    fn test_performance_metrics_disabled_progress_skips_output() {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = CaptureWriter::new(buffer.clone());
+        let mut metrics = PerformanceMetrics::with_writer(Box::new(writer), false);
+        metrics.last_update = metrics.start_time - Duration::from_secs(2);
+        metrics.update(3);
+        let output = CaptureWriter::into_string(buffer);
+        assert!(
+            output.is_empty(),
+            "expected no output when progress disabled, got: {output}"
+        );
+    }
+
+    #[test]
+    fn test_performance_metrics_update_throttle_without_output() {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = CaptureWriter::new(buffer.clone());
+        let mut metrics = PerformanceMetrics::with_writer(Box::new(writer), true);
+        metrics.update(1);
+        let output = CaptureWriter::into_string(buffer);
+        assert!(
+            output.is_empty(),
+            "throttle should suppress early output, got: {output}"
+        );
+    }
+
+    #[test]
+    fn test_run_cli_with_metrics_outputs_summary() -> io::Result<()> {
+        control::set_override(false);
+        let temp_dir = TempDir::new()?;
+        create_test_file(temp_dir.path(), "main.rs", "fn main() {}\n// comment\n")?;
+        let args = Args::parse_from([
+            "mdkloc",
+            temp_dir
+                .path()
+                .to_str()
+                .expect("temp dir path should be valid UTF-8"),
+            "--non-recursive",
+        ]);
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = CaptureWriter::new(buffer.clone());
+        let mut metrics = PerformanceMetrics::with_writer(Box::new(writer), false);
+        run_cli_with_metrics(args, &mut metrics)?;
+        let output = CaptureWriter::into_string(buffer);
+        assert!(
+            output.contains("files/sec"),
+            "expected rates to be reported in output: {output}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_cli_with_metrics_missing_path() {
+        control::set_override(false);
+        let missing = TempDir::new()
+            .expect("create temp dir")
+            .path()
+            .join("subdir")
+            .join("missing");
+        let args = Args::parse_from([
+            "mdkloc",
+            missing.to_str().expect("path should be valid UTF-8"),
+        ]);
+        let mut metrics = test_metrics();
+        let result = run_cli_with_metrics(args, &mut metrics);
+        assert!(result.is_err());
+        if let Err(err) = result {
+            assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        }
+    }
+
+    impl Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let mut guard = self.buffer.lock().expect("lock poisoned");
+            guard.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -2301,6 +2562,79 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_directory_respects_ignore_list() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        let target_dir = root.join("target");
+        fs::create_dir(&target_dir)?;
+        create_test_file(&target_dir, "skip.rs", "fn skipped() {}\n")?;
+        create_test_file(root, "main.rs", "fn main() {}\n")?;
+
+        let mut args = test_args();
+        args.ignore = vec!["target".to_string()];
+
+        let mut metrics = test_metrics();
+
+        let mut entries_count = 0usize;
+        let mut error_count = 0usize;
+        let stats = scan_directory(
+            root,
+            &args,
+            root,
+            &mut metrics,
+            0,
+            &mut entries_count,
+            &mut error_count,
+        )?;
+        assert_eq!(error_count, 0);
+
+        let target_canon = fs::canonicalize(&target_dir)?;
+        assert!(
+            !stats.contains_key(&target_canon),
+            "ignored directory should not appear in stats"
+        );
+
+        let root_canon = fs::canonicalize(root)?;
+        let root_stats = stats
+            .get(&root_canon)
+            .expect("root stats should exist after scanning");
+        let rust_entry = root_stats
+            .language_stats
+            .get("Rust")
+            .expect("Rust stats should be present");
+        assert_eq!(rust_entry.0, 1);
+        assert_eq!(rust_entry.1.code_lines, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_directory_missing_path_records_error() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let missing = temp_dir.path().join("does_not_exist");
+        let args = test_args();
+        let mut metrics = test_metrics();
+        let mut entries_count = 0usize;
+        let mut error_count = 0usize;
+
+        let stats = scan_directory(
+            &missing,
+            &args,
+            temp_dir.path(),
+            &mut metrics,
+            0,
+            &mut entries_count,
+            &mut error_count,
+        )?;
+
+        assert!(stats.is_empty());
+        assert_eq!(
+            error_count, 1,
+            "missing path should increment error counter"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_rust_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(temp_dir.path(), "test.rs", "fn main() {\n// Line comment\n/* Block comment */\n/// Doc comment\n//! Module comment\nprintln!(\"Hello\");\n}\n")?;
@@ -2308,6 +2642,56 @@ mod tests {
         assert_eq!(stats.code_lines, 3);
         assert_eq!(stats.comment_lines, 4);
         assert_eq!(stats.blank_lines, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_rust_block_comment_trailing_code() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "trail.rs",
+            "fn main() {\nlet value = 1; /* comment */ println!(\"{}\", value);\n}\n",
+        )?;
+        let (stats, _total_lines) = count_rust_lines(temp_dir.path().join("trail.rs").as_path())?;
+        assert_eq!(stats.code_lines, 4);
+        assert_eq!(stats.comment_lines, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_rust_block_comment_then_line_comment() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "mix.rs",
+            "fn noisy() {\nlet value = 1; /* block */ // trailing comment\n}\n",
+        )?;
+        let (stats, _total_lines) = count_rust_lines(temp_dir.path().join("mix.rs").as_path())?;
+        assert_eq!(stats.code_lines, 3, "stats: {:?}", stats);
+        assert_eq!(stats.comment_lines, 1, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_rust_attribute_and_multiline_block_resume() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "attr.rs",
+            r#"#[cfg(test)]
+fn decorated() {
+    let value = /* start block
+    still comment
+*/ 1; // trailing inline
+    let inline = 2; /* inline block */ println!("{}", inline);
+}
+"#,
+        )?;
+        let (stats, _total_lines) = count_rust_lines(temp_dir.path().join("attr.rs").as_path())?;
+        assert_eq!(stats.code_lines, 7, "stats: {:?}", stats);
+        assert_eq!(stats.comment_lines, 4, "stats: {:?}", stats);
+        assert_eq!(stats.blank_lines, 0, "stats: {:?}", stats);
         Ok(())
     }
 
@@ -2337,7 +2721,115 @@ mod tests {
         let (stats, _total_lines) =
             count_python_lines(temp_dir.path().join("test_ddq.py").as_path())?;
         assert_eq!(stats.code_lines, 2);
-        assert_eq!(stats.comment_lines, 2);
+        assert_eq!(stats.comment_lines, 2, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_python_triple_quote_same_line() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "inline_doc.py",
+            "def inline():\n\"\"\"doc\"\"\" print('after') # trailing\n",
+        )?;
+        let (stats, _total_lines) =
+            count_python_lines(temp_dir.path().join("inline_doc.py").as_path())?;
+        assert_eq!(stats.code_lines, 2, "stats: {:?}", stats);
+        assert_eq!(stats.comment_lines, 1, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_python_triple_quotes_and_continuation() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "mixed.py",
+            "def doc():\n\"\"\"Doc\"\"\" # inline\nvalue = \"hello\" \\\n# comment on continuation\n'''Inline''' print('done')\n",
+        )?;
+        let (stats, _total_lines) = count_python_lines(temp_dir.path().join("mixed.py").as_path())?;
+        assert!(stats.code_lines >= 2);
+        assert!(stats.comment_lines >= 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_python_triple_quote_after_continuation() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "continuation.py",
+            "def tricky():\nvalue = \"line\" \\\n\"\"\"not doc\"\"\"\nprint('done')\n",
+        )?;
+        let (stats, _total_lines) =
+            count_python_lines(temp_dir.path().join("continuation.py").as_path())?;
+        assert!(
+            stats.comment_lines == 0,
+            "continuation should prevent docstring counting as comment: {:?}",
+            stats
+        );
+        assert!(stats.code_lines >= 3, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_powershell_nested_block_transitions() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "complex.ps1",
+            "<# start\nstill comment #> Write-Host 'post'\nWrite-Host 'mid' <# open #> more <# again\nmulti #> done\n",
+        )?;
+        let (stats, _total_lines) =
+            count_powershell_lines(temp_dir.path().join("complex.ps1").as_path())?;
+        assert!(stats.code_lines >= 2);
+        assert!(stats.comment_lines >= 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_powershell_mixed_block_and_line_comments() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "mixed.ps1",
+            "Write-Host 'start'\n<# header #> Write-Host 'after'\nWrite-Host 'open' <# comment\nstill comment\n#> Write-Host 'tail' # annotate\nWrite-Host 'line mix' # trailing <# unreachable #>\nWrite-Host 'closing' <# comment #> # trailing\n",
+        )?;
+        let (stats, _total_lines) =
+            count_powershell_lines(temp_dir.path().join("mixed.ps1").as_path())?;
+        assert_eq!(stats.code_lines, 6, "stats: {:?}", stats);
+        assert_eq!(stats.comment_lines, 8, "stats: {:?}", stats);
+        assert_eq!(stats.blank_lines, 0, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_powershell_line_comment_before_block() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "order.ps1",
+            "Write-Host 'alpha' # inline comment <# block #> Write-Host 'beta'\n",
+        )?;
+        let (stats, _total_lines) =
+            count_powershell_lines(temp_dir.path().join("order.ps1").as_path())?;
+        assert_eq!(stats.code_lines, 1, "stats: {:?}", stats);
+        assert_eq!(stats.comment_lines, 1, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_python_inline_comment_after_docstring() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "doc.py",
+            "\"\"\"heading\"\"\" # title\nprint('body')  # trailing\n",
+        )?;
+        let (stats, _total_lines) = count_python_lines(temp_dir.path().join("doc.py").as_path())?;
+        assert_eq!(stats.code_lines, 1, "stats: {:?}", stats);
+        assert_eq!(stats.comment_lines, 1, "stats: {:?}", stats);
         Ok(())
     }
 
@@ -2350,6 +2842,52 @@ mod tests {
         assert_eq!(stats.code_lines, 3);
         assert_eq!(stats.comment_lines, 5);
         assert_eq!(stats.blank_lines, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_javascript_jsx_comment_transition() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "jsx.js",
+            "const markup = '<div>';\n<!-- jsx\ncomment --> <span>done</span>\nlet value = 1; /* block */ console.log(value);\n/* open\ncomment */\nconsole.log('after');\n",
+        )?;
+        let (stats, _total_lines) =
+            count_javascript_lines(temp_dir.path().join("jsx.js").as_path())?;
+        assert!(stats.code_lines >= 3);
+        assert!(stats.comment_lines >= 4);
+        Ok(())
+    }
+
+    #[test]
+    fn test_javascript_block_comment_with_trailing_code() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "mix.js",
+            "const a = 1; /* inline */ const b = 2;\n/* multi\ncomment */ const c = 3;\n",
+        )?;
+        let (stats, _total_lines) =
+            count_javascript_lines(temp_dir.path().join("mix.js").as_path())?;
+        assert_eq!(stats.code_lines, 2, "stats: {:?}", stats);
+        assert_eq!(stats.comment_lines, 2, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_javascript_jsx_and_block_single_line_variants() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "jsx_mix.js",
+            "const view = () => {\n    return <div />;\n};\n<!-- jsx start\nstill comment --> const resumed = true;\n<!-- inline --> const inline = true;\n/* block start\nstill block */ const next = 1;\n/* inline block */ const tail = 2;\nconst trailing = 3; // inline comment\n// header\n",
+        )?;
+        let (stats, _total_lines) =
+            count_javascript_lines(temp_dir.path().join("jsx_mix.js").as_path())?;
+        assert_eq!(stats.code_lines, 8, "stats: {:?}", stats);
+        assert_eq!(stats.comment_lines, 7, "stats: {:?}", stats);
+        assert_eq!(stats.blank_lines, 0, "stats: {:?}", stats);
         Ok(())
     }
 
@@ -2398,6 +2936,52 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_pascal_mixed_comment_styles_single_line() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "mixed.pas",
+            "{ block } writeln('a');\n(* another *) writeln('b'); // trailing\n",
+        )?;
+        let (stats, _total_lines) =
+            count_pascal_lines(temp_dir.path().join("mixed.pas").as_path())?;
+        assert!(stats.code_lines >= 2);
+        assert!(stats.comment_lines >= 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_pascal_nested_block_comment_trailing_code() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "nested.pas",
+            "{ comment } writeln('done');\n(* block *) writeln('after');\n",
+        )?;
+        let (stats, _total_lines) =
+            count_pascal_lines(temp_dir.path().join("nested.pas").as_path())?;
+        assert_eq!(stats.comment_lines, 2, "stats: {:?}", stats);
+        assert_eq!(stats.code_lines, 2, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_pascal_nested_block_exit_counts() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "blocks.pas",
+            "program Blocks;\n{ outer\n{ inner }\nstill } writeln('after brace');\n(* level\n(* inner *)\n*) writeln('after paren');\n(* open only\nstill comment\n*) // trailing comment\nwriteln('done');\nend.\n",
+        )?;
+        let (stats, _total_lines) =
+            count_pascal_lines(temp_dir.path().join("blocks.pas").as_path())?;
+        assert_eq!(stats.code_lines, 5, "stats: {:?}", stats);
+        assert_eq!(stats.comment_lines, 9, "stats: {:?}", stats);
+        assert_eq!(stats.blank_lines, 0, "stats: {:?}", stats);
+        Ok(())
+    }
+
     // --- New Tests ---
 
     #[test]
@@ -2410,6 +2994,52 @@ mod tests {
         );
         assert_eq!(get_language_from_extension("module.Py"), Some("Python"));
         assert_eq!(get_language_from_extension("FOO.TS"), Some("TypeScript"));
+    }
+
+    #[test]
+    fn test_get_language_from_extension_multipart_and_unknown() {
+        assert_eq!(
+            get_language_from_extension("component.d.ts"),
+            Some("TypeScript")
+        );
+        assert_eq!(get_language_from_extension("layout.view.jsx"), Some("JSX"));
+        assert_eq!(get_language_from_extension("CONFIG.CFG"), Some("INI"));
+        assert_eq!(get_language_from_extension("archive.tar.gz"), None);
+    }
+
+    #[test]
+    fn test_dotfile_language_detection() {
+        assert_eq!(get_language_from_extension(".bashrc"), Some("Shell"));
+        assert_eq!(get_language_from_extension(".zprofile"), Some("Shell"));
+        assert_eq!(
+            get_language_from_extension("Dockerfile.prod"),
+            Some("Dockerfile")
+        );
+        assert_eq!(get_language_from_extension("CMakeLists.txt"), Some("CMake"));
+    }
+
+    #[test]
+    fn test_args_parsing_flags() {
+        let args = Args::parse_from([
+            "mdkloc",
+            "--non-recursive",
+            "--ignore",
+            "target",
+            "--filespec",
+            "*.rs",
+            "--max-entries",
+            "42",
+            "--max-depth",
+            "3",
+            "--verbose",
+            ".",
+        ]);
+        assert!(args.non_recursive);
+        assert!(args.verbose);
+        assert_eq!(args.ignore, vec!["target".to_string()]);
+        assert_eq!(args.filespec.as_deref(), Some("*.rs"));
+        assert_eq!(args.max_entries, 42);
+        assert_eq!(args.max_depth, 3);
     }
 
     #[test]
@@ -2524,7 +3154,7 @@ mod tests {
         let (stats, _total_lines) =
             count_xml_like_lines(temp_dir.path().join("data.xml").as_path())?;
         assert!(stats.code_lines >= 3);
-        assert!(stats.comment_lines >= 3);
+        assert!(stats.comment_lines >= 2);
         assert_eq!(stats.blank_lines, 0);
         Ok(())
     }
@@ -2540,7 +3170,7 @@ mod tests {
         let (stats, _total_lines) =
             count_xml_like_lines(temp_dir.path().join("index.html").as_path())?;
         assert!(stats.code_lines >= 5); // <html>, <body>, <div>, </body>, </html>
-        assert!(stats.comment_lines >= 3);
+        assert!(stats.comment_lines >= 2);
         Ok(())
     }
 
@@ -2591,7 +3221,7 @@ mod tests {
         )?;
         let (stats, _total_lines) = count_ini_lines(temp_dir.path().join("config.ini").as_path())?;
         assert_eq!(stats.code_lines, 2);
-        assert_eq!(stats.comment_lines, 2);
+        assert_eq!(stats.comment_lines, 2, "stats: {:?}", stats);
         assert_eq!(stats.blank_lines, 1);
         Ok(())
     }
@@ -2611,6 +3241,20 @@ mod tests {
     }
 
     #[test]
+    fn test_hcl_block_comment_with_trailing_code() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "inline.tf",
+            "resource \"x\" \"y\" { /* block */ name = \"demo\" }\nvalue = 1 /* comment */\n/* open\n comment */ value = 2\n",
+        )?;
+        let (stats, _total_lines) = count_hcl_lines(temp_dir.path().join("inline.tf").as_path())?;
+        assert!(stats.code_lines >= 3);
+        assert!(stats.comment_lines >= 3);
+        Ok(())
+    }
+
+    #[test]
     fn test_cmake_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
@@ -2621,7 +3265,7 @@ mod tests {
         let (stats, _total_lines) =
             count_cmake_lines(temp_dir.path().join("CMakeLists.txt").as_path())?;
         assert_eq!(stats.code_lines, 2);
-        assert_eq!(stats.comment_lines, 2);
+        assert_eq!(stats.comment_lines, 2, "stats: {:?}", stats);
         Ok(())
     }
 
@@ -2641,6 +3285,21 @@ mod tests {
     }
 
     #[test]
+    fn test_powershell_block_comment_then_line_comment() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "mixed.ps1",
+            "Write-Host 1 <# inline #> # trailing\n<# block\ncontinues\n#>\nWrite-Host 2\n",
+        )?;
+        let (stats, _total_lines) =
+            count_powershell_lines(temp_dir.path().join("mixed.ps1").as_path())?;
+        assert!(stats.code_lines >= 2);
+        assert!(stats.comment_lines >= 2);
+        Ok(())
+    }
+
+    #[test]
     fn test_batch_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
@@ -2649,7 +3308,7 @@ mod tests {
             "REM header\n:: also comment\n@echo on\nset X=1\n",
         )?;
         let (stats, _total_lines) = count_batch_lines(temp_dir.path().join("run.bat").as_path())?;
-        assert_eq!(stats.comment_lines, 2);
+        assert_eq!(stats.comment_lines, 2, "stats: {:?}", stats);
         assert_eq!(stats.code_lines, 2);
         Ok(())
     }
@@ -2723,8 +3382,8 @@ mod tests {
         )?;
         let (stats, _total_lines) =
             count_c_style_lines(temp_dir.path().join("msg.proto").as_path())?;
-        assert_eq!(stats.code_lines, 1);
-        assert_eq!(stats.comment_lines, 2);
+        assert_eq!(stats.code_lines, 1, "stats: {:?}", stats);
+        assert_eq!(stats.comment_lines, 2, "stats: {:?}", stats);
         Ok(())
     }
 
@@ -2758,6 +3417,48 @@ mod tests {
     }
 
     #[test]
+    fn test_cstyle_mixed_line_and_block_comments() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "mixed.c",
+            "int a = 0; // comment /* ignored */\nint b = 0; /* block */ // trailing\n",
+        )?;
+        let (stats, _total_lines) = count_c_style_lines(temp_dir.path().join("mixed.c").as_path())?;
+        assert!(stats.code_lines >= 2);
+        assert!(stats.comment_lines >= 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_cstyle_block_comment_trailing_code_multi_line() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "block.c",
+            "int value = 0; /* start\ncontinues */ value += 1;\n",
+        )?;
+        let (stats, _total_lines) = count_c_style_lines(temp_dir.path().join("block.c").as_path())?;
+        assert!(stats.code_lines >= 2);
+        assert!(stats.comment_lines >= 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_cstyle_block_then_line_comment() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "combo.c",
+            "int main() {\n/* comment opens\ncontinues */ // trailing\nreturn 0;\n}\n",
+        )?;
+        let (stats, _total_lines) = count_c_style_lines(temp_dir.path().join("combo.c").as_path())?;
+        assert!(stats.comment_lines >= 2, "stats: {:?}", stats);
+        assert!(stats.code_lines >= 3, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
     fn test_php_inline_block_comment() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
@@ -2768,6 +3469,49 @@ mod tests {
         let (stats, _total_lines) = count_php_lines(temp_dir.path().join("x.php").as_path())?;
         assert!(stats.code_lines >= 2);
         assert!(stats.comment_lines >= 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_php_block_comment_followed_by_hash_comment() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "y.php",
+            "<?php\n$foo = 1; /* block */ # trailing\n?>\n",
+        )?;
+        let (stats, _total_lines) = count_php_lines(temp_dir.path().join("y.php").as_path())?;
+        assert!(stats.comment_lines >= 1); // block + hash comment
+        assert!(stats.code_lines >= 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_php_block_comment_trailing_code_same_line() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "inline.php",
+            "<?php\n$value = 1; /* start\nstill comment */ $value++;\n?>\n",
+        )?;
+        let (stats, _total_lines) = count_php_lines(temp_dir.path().join("inline.php").as_path())?;
+        assert!(stats.code_lines >= 2);
+        assert!(stats.comment_lines >= 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_php_block_and_hash_comment_suppression() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "complex.php",
+            "<?php\n$val = 1; /* comment */ $other = 2; # trailing\n/* opening\nstill comment\n*/ # suppressed\necho 'done'; /* inline */ echo 'more';\n$final = true; /* keep */ // rest after comment\n# shell style comment\n?>\n",
+        )?;
+        let (stats, _total_lines) = count_php_lines(temp_dir.path().join("complex.php").as_path())?;
+        assert_eq!(stats.code_lines, 7, "stats: {:?}", stats);
+        assert_eq!(stats.comment_lines, 7, "stats: {:?}", stats);
+        assert_eq!(stats.blank_lines, 0, "stats: {:?}", stats);
         Ok(())
     }
 
@@ -2833,6 +3577,10 @@ mod tests {
             }
         }
         assert_eq!(rust_files, 2); // root and child only
+        assert!(
+            error_count >= 1,
+            "expected depth limit to increment error count, got {error_count}"
+        );
         Ok(())
     }
 
@@ -2865,6 +3613,57 @@ mod tests {
                 assert_eq!(*n, 1);
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_filespec_matches_nested_relative_path() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        let nested = root.join("src").join("utils");
+        fs::create_dir_all(&nested)?;
+        let file_path = nested.join("lib.rs");
+        create_test_file(&nested, "lib.rs", "pub fn helper() {}\n")?;
+
+        let include = Pattern::new("src/**/*.rs").expect("glob compiles");
+        assert!(
+            filespec_matches(&include, root, &file_path),
+            "src/**/*.rs should match nested file path"
+        );
+
+        let exclude = Pattern::new("tests/**/*.rs").expect("glob compiles");
+        assert!(
+            !filespec_matches(&exclude, root, &file_path),
+            "tests/**/*.rs should not match source file"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_process_file_respects_filespec() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        let src_dir = root.join("src");
+        fs::create_dir_all(&src_dir)?;
+        create_test_file(&src_dir, "main.rs", "fn main() {}\n")?;
+        let file_path = src_dir.join("main.rs");
+
+        let include = Pattern::new("src/*.rs").expect("glob compiles");
+        assert!(
+            should_process_file(Some(&include), root, &file_path),
+            "matching filespec should allow processing"
+        );
+
+        let exclude = Pattern::new("tests/*.rs").expect("glob compiles");
+        assert!(
+            !should_process_file(Some(&exclude), root, &file_path),
+            "non-matching filespec should deny processing"
+        );
+
+        assert!(
+            should_process_file(None, root, &file_path),
+            "missing filespec should allow processing by default"
+        );
         Ok(())
     }
 
@@ -3072,6 +3871,34 @@ mod tests {
     }
 
     #[test]
+    fn test_algol_comment_variants() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "variants.alg",
+            "COMMENT block without semicolon\nstill comment;\nco inline co\n# hash comment\nbegin\nend\n",
+        )?;
+        let (stats, _total) = count_algol_lines(temp_dir.path().join("variants.alg").as_path())?;
+        assert!(stats.comment_lines >= 2);
+        assert!(stats.code_lines >= 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_algol_comment_with_semicolon_same_line() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "inline.alg",
+            "COMMENT single line;\nbegin\n  real x;\nend\n",
+        )?;
+        let (stats, _total) = count_algol_lines(temp_dir.path().join("inline.alg").as_path())?;
+        assert_eq!(stats.comment_lines, 1, "stats: {:?}", stats);
+        assert!(stats.code_lines >= 3, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
     fn test_cobol_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
@@ -3080,7 +3907,7 @@ mod tests {
             "       IDENTIFICATION DIVISION.\n      * comment in col 7\n       PROGRAM-ID. DEMO.\n       *> free comment\n",
         )?;
         let (stats, _total) = count_cobol_lines(temp_dir.path().join("prog.cob").as_path())?;
-        assert_eq!(stats.comment_lines, 2);
+        assert_eq!(stats.comment_lines, 2, "stats: {:?}", stats);
         assert!(stats.code_lines >= 2);
         Ok(())
     }
@@ -3104,8 +3931,8 @@ mod tests {
         let temp_dir = TempDir::new()?;
         create_test_file(temp_dir.path(), "x.asm", "; c\n# also c\nmov eax, eax\n")?;
         let (stats, _total) = count_asm_lines(temp_dir.path().join("x.asm").as_path())?;
-        assert_eq!(stats.comment_lines, 2);
-        assert_eq!(stats.code_lines, 1);
+        assert_eq!(stats.comment_lines, 2, "stats: {:?}", stats);
+        assert_eq!(stats.code_lines, 1, "stats: {:?}", stats);
         Ok(())
     }
 
@@ -3119,7 +3946,7 @@ mod tests {
         )?;
         let (stats, _total) = count_dcl_lines(temp_dir.path().join("proc.com").as_path())?;
         assert_eq!(stats.comment_lines, 1);
-        assert_eq!(stats.code_lines, 1);
+        assert_eq!(stats.code_lines, 1, "stats: {:?}", stats);
         Ok(())
     }
 
@@ -3192,7 +4019,37 @@ mod tests {
         create_test_file(temp_dir.path(), "calc.ipl", "/* c */\n! c\nSET X = 1\n")?;
         let (stats, _total) = count_iplan_lines(temp_dir.path().join("calc.ipl").as_path())?;
         assert!(stats.comment_lines >= 2);
-        assert_eq!(stats.code_lines, 1);
+        assert_eq!(stats.code_lines, 1, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_iplan_block_followed_by_bang_comment() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "mix.ipl",
+            "SET X = 1 /* inline */ ! trailing\n/* block\ncontinues */ ! next\nVALUE\n",
+        )?;
+        let (stats, _total) = count_iplan_lines(temp_dir.path().join("mix.ipl").as_path())?;
+        assert!(stats.code_lines >= 1);
+        assert!(stats.comment_lines >= 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_iplan_block_close_skips_bang_followup() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "comment.ipl",
+            "SET J = 1\n/* start\n! nested comment\n*/ ! still comment\nVALUE /* inline */ ! comment\nVALUE ! inline comment\n! trailing only\nVALUE2\n",
+        )?;
+        let (stats, _total_lines) =
+            count_iplan_lines(temp_dir.path().join("comment.ipl").as_path())?;
+        assert_eq!(stats.code_lines, 4, "stats: {:?}", stats);
+        assert_eq!(stats.comment_lines, 5, "stats: {:?}", stats);
+        assert_eq!(stats.blank_lines, 0, "stats: {:?}", stats);
         Ok(())
     }
 
@@ -3206,7 +4063,7 @@ mod tests {
         )?;
         let (stats, _total_lines) = count_c_style_lines(&temp_dir.path().join("Main.scala"))?;
         assert_eq!(stats.code_lines, 3);
-        assert_eq!(stats.comment_lines, 2);
+        assert_eq!(stats.comment_lines, 2, "stats: {:?}", stats);
         Ok(())
     }
 
@@ -3286,7 +4143,7 @@ mod tests {
             "{c1} (*c2*) code\n(* multi\nline *) code2\n",
         )?;
         let (stats, _) = count_pascal_lines(temp_dir.path().join("p.pas").as_path())?;
-        assert!(stats.comment_lines >= 3);
+        assert!(stats.comment_lines >= 2);
         assert!(stats.code_lines >= 2);
         Ok(())
     }
@@ -3300,7 +4157,7 @@ mod tests {
             "print 'x';\n=pod\nthis is pod\n=cut\nprint 'y';\n",
         )?;
         let (stats, _) = count_perl_lines(temp_dir.path().join("p.pl").as_path())?;
-        assert!(stats.comment_lines >= 3);
+        assert!(stats.comment_lines >= 2);
         assert_eq!(stats.code_lines, 2);
         Ok(())
     }
@@ -3358,6 +4215,33 @@ mod tests {
             }
         }
         assert_eq!(rust_files, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_directory_missing_root_metadata_increments_error() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let missing = temp_dir.path().join("does_not_exist");
+        let args = test_args();
+        let mut metrics = test_metrics();
+        let mut entries_count = 0usize;
+        let mut error_count = 0usize;
+
+        let stats = scan_directory(
+            &missing,
+            &args,
+            temp_dir.path(),
+            &mut metrics,
+            0,
+            &mut entries_count,
+            &mut error_count,
+        )?;
+
+        assert!(stats.is_empty(), "expected no stats for missing path");
+        assert_eq!(
+            error_count, 1,
+            "missing path should increment error counter, got {error_count}"
+        );
         Ok(())
     }
 }

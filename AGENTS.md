@@ -1,38 +1,35 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `src/main.rs` — CLI entry point and core logic for multi-language LOC/statistics.
-- `Cargo.toml`/`Cargo.lock` — crate metadata and dependencies.
-- `readme.md` — usage and overview; `LICENSE` — licensing.
-- Optional tests live in `tests/` (integration) and `#[cfg(test)]` modules (unit).
-- Model notes: `GEMINI.md`, `CLAUDE.md` are companion docs. This AGENTS.md applies repo-wide.
+- `src/main.rs` hosts the CLI entry point and primary logic for counting lines of code across languages.
+- `Cargo.toml` and `Cargo.lock` capture crate metadata, dependencies, and reproducible builds; edit `Cargo.toml` only when a dependency or feature genuinely changes.
+- Place unit tests beside the code they exercise under `#[cfg(test)]`. Integration scenarios live in `tests/`.
+- `readme.md` documents usage; update it whenever flags, output formats, or notable workflows change.
 
 ## Build, Test, and Development Commands
-- `cargo build` — compile in debug mode.
-- `cargo run -- <path> [flags]` — run locally (e.g., `cargo run -- . -v -f "*.rs"`).
-- `cargo test` — run unit/integration tests.
-- `cargo fmt` — format code with rustfmt.
-- `cargo clippy -- -D warnings` — lint and treat warnings as errors.
-- `cargo run -- --help` — view CLI options.
+- `cargo build` compiles in debug mode; use before submitting changes to surface compiler warnings early.
+- `cargo run -- <path> [flags]` executes the CLI locally, for example `cargo run -- . -v -f "*.rs"`.
+- `cargo test` runs all unit and integration suites; append `-- --nocapture` when you need diagnostic output.
+- `cargo fmt` applies repository formatting defaults; run prior to opening a pull request.
+- `cargo clippy -- -D warnings` enforces lint cleanliness by treating warnings as failures.
 
 ## Coding Style & Naming Conventions
-- Rust 2021; rustfmt defaults (4-space indent). Run `cargo fmt` before commits.
-- Naming: `snake_case` for functions/vars, `CamelCase` for types/traits, `SCREAMING_SNAKE_CASE` for consts.
-- Errors: return `Result<T, E>`, prefer `?`; avoid `unwrap()`/`expect()` outside tests.
-- Keep functions small and focused; prefer clear, non-allocating paths in hot loops.
+- Target Rust 2021 idioms with 4-space indentation and rustfmt defaults; avoid manual alignment that rustfmt would reflow.
+- Prefer `snake_case` for functions and variables, `CamelCase` for types, and `SCREAMING_SNAKE_CASE` for constants.
+- Use `Result<T, E>` and the `?` operator for error propagation; reserve `unwrap()`/`expect()` for tests.
+- Keep functions compact and avoid unnecessary allocations in tight loops.
 
 ## Testing Guidelines
-- Unit tests colocated under `#[cfg(test)] mod tests { ... }` near the code.
-- Integration tests in `tests/*.rs` (e.g., `tests/cli_counts.rs`).
-- Use descriptive names and cover core parsing branches and edge cases (comments, blanks, encodings).
-- Run `cargo test -- --nocapture` to view printed diagnostics.
+- Cover edge cases like blank lines, comments, mixed encodings, and multi-language directories.
+- Name tests descriptively (e.g., `counts_ignore_comments`) and place integration fixtures under `tests/`.
+- Validate behavioural changes with `cargo test` and, where relevant, targeted `cargo run` examples.
 
 ## Commit & Pull Request Guidelines
-- Commits: imperative, concise summaries (e.g., "Add support for TOML", "Fix PHP post-comment code detection"). One logical change per commit.
-- PRs: clear description, rationale, reproduction steps, and sample before/after output. Link related issues. Ensure `cargo fmt`, `clippy`, and tests pass.
+- Write imperative, single-purpose commit messages (e.g., “Add support for TOML reports”).
+- Ensure every PR includes a short rationale, reproduction steps, and sample before/after CLI output.
+- Confirm `cargo fmt`, `cargo clippy -- -D warnings`, and `cargo test` all pass before requesting review.
 
-## Agent-Specific Instructions
-- Scope: applies to the entire repository. Make minimal, targeted changes and preserve file names and public behavior unless necessary.
-- Don’t add new dependencies without justification. Update `readme.md` when behavior or flags change.
-- Validate locally: run `cargo fmt`, `cargo clippy -- -D warnings`, and `cargo test` before proposing changes.
-- Avoid introducing secrets, network calls, or license headers.
+## Agent-Specific Notes
+- Make minimal, targeted edits; do not rename files or adjust public interfaces without necessity.
+- Avoid adding dependencies unless they unlock required functionality; discuss trade-offs in PR notes.
+- Never introduce secrets, network calls, or license headers. If unexpected external changes appear, pause and seek guidance.
