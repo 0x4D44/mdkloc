@@ -12,8 +12,9 @@
 use clap::{ArgAction, Parser};
 use std::collections::HashMap;
 use std::env;
+use std::fmt::Write as FmtWrite;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use colored::*;
@@ -25,6 +26,12 @@ use std::time::{Duration, Instant};
 // Fixed width for the directory column.
 const DIR_WIDTH: usize = 40;
 const LANG_WIDTH: usize = 16;
+
+const METADATA_FAIL_TAG: &str = "__mdkloc_metadata_fail__";
+const READ_DIR_FAIL_TAG: &str = "__mdkloc_read_dir_fail__";
+const ENTRY_ITER_FAIL_TAG: &str = "__mdkloc_entry_iter_fail__";
+const FILE_TYPE_FAIL_TAG: &str = "__mdkloc_file_type_fail__.rs";
+const FAULT_ENV_VAR: &str = "MDKLOC_ENABLE_FAULTS";
 
 // Performance metrics structure
 struct PerformanceMetrics {
@@ -100,6 +107,42 @@ fn normalize_stats(mut stats: LanguageStats, total_lines: u64) -> LanguageStats 
         stats.overlap_lines = 0;
     }
     stats
+}
+
+fn merge_directory_stats(
+    target: &mut HashMap<PathBuf, DirectoryStats>,
+    dir: PathBuf,
+    stat: DirectoryStats,
+) {
+    if let Some(existing) = target.get_mut(&dir) {
+        for (lang, (count, lang_stats)) in stat.language_stats {
+            let (existing_count, existing_stats) = existing
+                .language_stats
+                .entry(lang)
+                .or_insert((0, LanguageStats::default()));
+            *existing_count += count;
+            existing_stats.code_lines += lang_stats.code_lines;
+            existing_stats.comment_lines += lang_stats.comment_lines;
+            existing_stats.blank_lines += lang_stats.blank_lines;
+            existing_stats.overlap_lines += lang_stats.overlap_lines;
+        }
+    } else {
+        target.insert(dir, stat);
+    }
+}
+
+fn find_powershell_line_comment(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    for (idx, &b) in bytes.iter().enumerate() {
+        if b == b'#' {
+            let is_block_start = idx > 0 && bytes[idx - 1] == b'<';
+            let is_block_end = idx + 1 < bytes.len() && bytes[idx + 1] == b'>';
+            if !is_block_start && !is_block_end {
+                return Some(idx);
+            }
+        }
+    }
+    None
 }
 
 impl PerformanceMetrics {
@@ -180,16 +223,25 @@ impl PerformanceMetrics {
 
 /// Reads a file’s entire content as lines, converting invalid UTF‑8 sequences using replacement characters.
 struct LossyLineReader {
-    reader: BufReader<fs::File>,
+    reader: BufReader<Box<dyn Read + Send>>,
     buffer: Vec<u8>,
 }
 
 impl LossyLineReader {
     fn new(file: fs::File) -> Self {
+        Self::from_reader(Box::new(file))
+    }
+
+    fn from_reader(reader: Box<dyn Read + Send>) -> Self {
         Self {
-            reader: BufReader::new(file),
+            reader: BufReader::new(reader),
             buffer: Vec::with_capacity(8 * 1024),
         }
+    }
+
+    #[cfg(test)]
+    fn with_reader<R: Read + Send + 'static>(reader: R) -> Self {
+        Self::from_reader(Box::new(reader))
     }
 }
 
@@ -340,6 +392,111 @@ fn truncate_start(s: &str, max_len: usize) -> String {
         let truncated: String = s.chars().skip(skip_count).collect();
         format!("...{}", truncated)
     }
+}
+
+fn format_directory_display(path: &Path, current_dir: &Path) -> String {
+    let raw = match path.strip_prefix(current_dir) {
+        Ok(p) if p.as_os_str().is_empty() => ".".to_string(),
+        Ok(p) => p.to_string_lossy().into_owned(),
+        Err(_) => path.to_string_lossy().into_owned(),
+    };
+    truncate_start(&raw, DIR_WIDTH)
+}
+
+fn failure_injection_enabled() -> bool {
+    cfg!(test) || std::env::var_os(FAULT_ENV_VAR).is_some()
+}
+
+fn should_simulate_path_failure(path: &Path, needle: &str) -> bool {
+    failure_injection_enabled()
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name == needle)
+            .unwrap_or(false)
+}
+
+fn should_simulate_entry_failure(entry: &fs::DirEntry, needle: &str) -> bool {
+    failure_injection_enabled()
+        && entry
+            .file_name()
+            .to_str()
+            .map(|name| name == needle)
+            .unwrap_or(false)
+}
+
+fn fetch_metadata(path: &Path) -> io::Result<fs::Metadata> {
+    if should_simulate_path_failure(path, METADATA_FAIL_TAG) {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "simulated metadata read failure",
+        ));
+    }
+    fs::metadata(path)
+}
+
+struct ReadDirStream {
+    inner: fs::ReadDir,
+    #[cfg(test)]
+    injected_error: Option<io::Error>,
+}
+
+impl ReadDirStream {
+    #[cfg(test)]
+    fn new(inner: fs::ReadDir, inject_entry_error: bool) -> Self {
+        let injected_error = inject_entry_error.then(|| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                "simulated directory entry iteration failure",
+            )
+        });
+        ReadDirStream {
+            inner,
+            injected_error,
+        }
+    }
+
+    #[cfg(not(test))]
+    fn new(inner: fs::ReadDir, _inject_entry_error: bool) -> Self {
+        ReadDirStream { inner }
+    }
+}
+
+impl Iterator for ReadDirStream {
+    type Item = io::Result<fs::DirEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        #[cfg(test)]
+        if let Some(err) = self.injected_error.take() {
+            return Some(Err(err));
+        }
+
+        self.inner.next()
+    }
+}
+
+fn read_dir_stream(path: &Path) -> io::Result<ReadDirStream> {
+    if should_simulate_path_failure(path, READ_DIR_FAIL_TAG) {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "simulated read_dir failure",
+        ));
+    }
+    let iter = fs::read_dir(path)?;
+    Ok(ReadDirStream::new(
+        iter,
+        should_simulate_path_failure(path, ENTRY_ITER_FAIL_TAG),
+    ))
+}
+
+fn entry_file_type(entry: &fs::DirEntry) -> io::Result<fs::FileType> {
+    if should_simulate_entry_failure(entry, FILE_TYPE_FAIL_TAG) {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "simulated file_type failure",
+        ));
+    }
+    entry.file_type()
 }
 
 fn safe_rate(value: u64, elapsed_secs: f64) -> f64 {
@@ -1086,9 +1243,17 @@ fn count_hcl_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
                     stats.comment_lines += 1;
                     s = &s[end + 2..];
                     in_block = false;
-                    if s.trim().is_empty() {
+                    let after_trimmed = s.trim_start();
+                    if after_trimmed.is_empty() {
+                        break;
+                    } else if after_trimmed.starts_with("##")
+                        || after_trimmed.starts_with("//")
+                        || after_trimmed.starts_with('#')
+                    {
+                        stats.comment_lines += 1;
                         break;
                     } else {
+                        s = after_trimmed;
                         continue;
                     }
                 } else {
@@ -1115,30 +1280,23 @@ fn count_hcl_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
                         _ => Some(("/*", i)),
                     };
                 }
-                match next {
-                    None => {
-                        if !s.trim().is_empty() {
-                            stats.code_lines += 1;
-                        }
-                        break;
-                    }
-                    Some(("//", i)) => {
+                if let Some((token, i)) = next {
+                    if token == "//" {
                         let before = &s[..i];
                         if !before.trim().is_empty() {
                             stats.code_lines += 1;
                         }
                         stats.comment_lines += 1;
                         break;
-                    }
-                    Some(("#", i)) => {
+                    } else if token == "#" {
                         let before = &s[..i];
                         if !before.trim().is_empty() {
                             stats.code_lines += 1;
                         }
                         stats.comment_lines += 1;
                         break;
-                    }
-                    Some(("/*", i)) => {
+                    } else {
+                        debug_assert_eq!(token, "/*");
                         let before = &s[..i];
                         if !before.trim().is_empty() {
                             stats.code_lines += 1;
@@ -1147,9 +1305,17 @@ fn count_hcl_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
                         s = &s[i + 2..];
                         if let Some(end) = s.find("*/") {
                             s = &s[end + 2..];
-                            if s.trim().is_empty() {
+                            let after_trimmed = s.trim_start();
+                            if after_trimmed.is_empty() {
+                                break;
+                            } else if after_trimmed.starts_with("##")
+                                || after_trimmed.starts_with("//")
+                                || after_trimmed.starts_with('#')
+                            {
+                                stats.comment_lines += 1;
                                 break;
                             } else {
+                                s = after_trimmed;
                                 continue;
                             }
                         } else {
@@ -1157,7 +1323,11 @@ fn count_hcl_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
                             break;
                         }
                     }
-                    _ => unreachable!(),
+                } else {
+                    if !s.trim().is_empty() {
+                        stats.code_lines += 1;
+                    }
+                    break;
                 }
             }
         }
@@ -1181,6 +1351,17 @@ fn count_rst_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
     Ok((stats, total_lines))
 }
 
+fn apply_velocity_tail(fragment: &str, stats: &mut LanguageStats) {
+    if fragment.is_empty() {
+        return;
+    }
+    if fragment.starts_with("##") {
+        stats.comment_lines += 1;
+    } else {
+        stats.code_lines += 1;
+    }
+}
+
 fn count_velocity_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
     // Velocity: '##' line comments, '#* ... *#' block comments. Count code before/after markers.
     let mut stats = LanguageStats::default();
@@ -1199,9 +1380,8 @@ fn count_velocity_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
             if let Some(pos) = trimmed.find("*#") {
                 in_block = false;
                 let after = &trimmed[(pos + 2)..];
-                if !after.trim().is_empty() && !after.trim_start().starts_with("##") {
-                    stats.code_lines += 1;
-                }
+                let after_trimmed = after.trim_start();
+                apply_velocity_tail(after_trimmed, &mut stats);
             }
             continue;
         }
@@ -1219,9 +1399,8 @@ fn count_velocity_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
                 in_block = true;
             } else if let Some(end) = trimmed[pos..].find("*#") {
                 let after = &trimmed[(pos + end + 2)..];
-                if !after.trim().is_empty() && !after.trim_start().starts_with("##") {
-                    stats.code_lines += 1;
-                }
+                let after_trimmed = after.trim_start();
+                apply_velocity_tail(after_trimmed, &mut stats);
             }
             continue;
         }
@@ -1523,7 +1702,7 @@ fn count_powershell_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> 
                     break;
                 }
             } else {
-                let p_line = s.find('#');
+                let p_line = find_powershell_line_comment(s);
                 let p_block = s.find("<#");
                 match (p_line, p_block) {
                     (None, None) => {
@@ -1849,7 +2028,7 @@ fn scan_directory_impl(
         return Ok(stats);
     }
 
-    let metadata = match fs::metadata(path) {
+    let metadata = match fetch_metadata(path) {
         Ok(meta) => meta,
         Err(err) => {
             eprintln!("Error reading metadata for {}: {}", path.display(), err);
@@ -1876,7 +2055,7 @@ fn scan_directory_impl(
         return Ok(stats);
     }
 
-    let read_dir = match fs::read_dir(path) {
+    let read_dir = match read_dir_stream(path) {
         Ok(iter) => iter,
         Err(err) => {
             eprintln!("Error reading directory {}: {}", path.display(), err);
@@ -1896,7 +2075,7 @@ fn scan_directory_impl(
         };
 
         let entry_path = entry.path();
-        let file_type = match entry.file_type() {
+        let file_type = match entry_file_type(&entry) {
             Ok(ft) => ft,
             Err(err) => {
                 eprintln!("Error reading type for {}: {}", entry_path.display(), err);
@@ -1921,21 +2100,7 @@ fn scan_directory_impl(
             ) {
                 Ok(sub_stats) => {
                     for (dir, stat) in sub_stats {
-                        if let Some(existing) = stats.get_mut(&dir) {
-                            for (lang, (count, lang_stats)) in stat.language_stats {
-                                let (existing_count, existing_stats) = existing
-                                    .language_stats
-                                    .entry(lang)
-                                    .or_insert((0, LanguageStats::default()));
-                                *existing_count += count;
-                                existing_stats.code_lines += lang_stats.code_lines;
-                                existing_stats.comment_lines += lang_stats.comment_lines;
-                                existing_stats.blank_lines += lang_stats.blank_lines;
-                                existing_stats.overlap_lines += lang_stats.overlap_lines;
-                            }
-                        } else {
-                            stats.insert(dir, stat);
-                        }
+                        merge_directory_stats(&mut stats, dir, stat);
                     }
                 }
                 Err(err) => {
@@ -2013,12 +2178,137 @@ fn format_language_stats_line(
     )
 }
 
-fn print_language_stats(prefix: &str, lang: &str, file_count: u64, stats: &LanguageStats) {
-    // Keep rows uncolored to ensure ANSI-safe alignment; headers are colored separately.
-    println!(
-        "{}",
-        format_language_stats_line(prefix, lang, file_count, stats)
+fn build_analysis_report(
+    current_dir: &Path,
+    stats: &HashMap<PathBuf, DirectoryStats>,
+    files_processed: u64,
+    lines_processed: u64,
+    error_count: usize,
+) -> String {
+    let mut output = String::new();
+    let mut sorted_stats: Vec<_> = stats.iter().collect();
+    sorted_stats.sort_by(|(a, _), (b, _)| a.to_string_lossy().cmp(&b.to_string_lossy()));
+
+    let mut total_by_language: HashMap<String, (u64, LanguageStats)> = HashMap::new();
+
+    let _ = writeln!(output, "\n\nDetailed source code analysis:");
+    let _ = writeln!(output, "{}", "-".repeat(112));
+    let _ = writeln!(
+        output,
+        "{:<40} {:<width$} {:>8} {:>10} {:>10} {:>10} {:>10}",
+        "Directory",
+        "Language",
+        "Files",
+        "Code",
+        "Comments",
+        "Mixed",
+        "Blank",
+        width = LANG_WIDTH
     );
+    let _ = writeln!(output, "{}", "-".repeat(112));
+
+    for (path, dir_stats) in sorted_stats {
+        let display_path = format_directory_display(path, current_dir);
+        let mut languages: Vec<_> = dir_stats.language_stats.iter().collect();
+        languages.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+        for (lang, (file_count, lang_stats)) in languages {
+            let line = format_language_stats_line(&display_path, lang, *file_count, lang_stats);
+            let _ = writeln!(output, "{}", line);
+            let (total_count, total_stats) = total_by_language
+                .entry(lang.to_string())
+                .or_insert((0, LanguageStats::default()));
+            *total_count += file_count;
+            total_stats.code_lines += lang_stats.code_lines;
+            total_stats.comment_lines += lang_stats.comment_lines;
+            total_stats.blank_lines += lang_stats.blank_lines;
+            total_stats.overlap_lines += lang_stats.overlap_lines;
+        }
+    }
+
+    let _ = writeln!(output, "{:-<112}", "");
+    let _ = writeln!(output, "Totals by language:");
+
+    let mut sorted_totals: Vec<_> = total_by_language.iter().collect();
+    sorted_totals.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+    for (lang, (file_count, stats)) in sorted_totals {
+        let line = format_language_stats_line("", lang, *file_count, stats);
+        let _ = writeln!(output, "{}", line);
+    }
+
+    let mut grand_total = LanguageStats::default();
+    for (_, (_files, stats)) in total_by_language.iter() {
+        grand_total.code_lines += stats.code_lines;
+        grand_total.comment_lines += stats.comment_lines;
+        grand_total.blank_lines += stats.blank_lines;
+        grand_total.overlap_lines += stats.overlap_lines;
+    }
+
+    if files_processed > 0 || lines_processed > 0 {
+        let _ = writeln!(output, "\n{}", "Overall Summary:".blue().bold());
+        let _ = writeln!(
+            output,
+            "Total files processed: {}",
+            files_processed.to_string().bright_yellow()
+        );
+        let _ = writeln!(
+            output,
+            "Total lines processed: {}",
+            lines_processed.to_string().bright_yellow()
+        );
+        let _ = writeln!(
+            output,
+            "Code lines:     {} ({})",
+            grand_total.code_lines.to_string().bright_yellow(),
+            format!(
+                "{:.1}%",
+                safe_percentage(grand_total.code_lines, lines_processed)
+            )
+            .bright_yellow()
+        );
+        let _ = writeln!(
+            output,
+            "Comment lines:  {} ({})",
+            grand_total.comment_lines.to_string().bright_yellow(),
+            format!(
+                "{:.1}%",
+                safe_percentage(grand_total.comment_lines, lines_processed)
+            )
+            .bright_yellow()
+        );
+        let _ = writeln!(
+            output,
+            "Mixed lines:    {} ({})",
+            grand_total.overlap_lines.to_string().bright_yellow(),
+            format!(
+                "{:.1}%",
+                safe_percentage(grand_total.overlap_lines, lines_processed)
+            )
+            .bright_yellow()
+        );
+        let _ = writeln!(
+            output,
+            "Blank lines:    {} ({})",
+            grand_total.blank_lines.to_string().bright_yellow(),
+            format!(
+                "{:.1}%",
+                safe_percentage(grand_total.blank_lines, lines_processed)
+            )
+            .bright_yellow()
+        );
+
+        if error_count > 0 {
+            let _ = writeln!(
+                output,
+                "\n{}: {}",
+                "Warning".red().bold(),
+                error_count.to_string().bright_yellow()
+            );
+        }
+    }
+
+    output
 }
 
 fn main() -> io::Result<()> {
@@ -2062,127 +2352,14 @@ fn run_cli_with_metrics(args: Args, metrics: &mut PerformanceMetrics) -> io::Res
     let lines_processed = metrics.lines_processed.load(Ordering::Relaxed);
 
     // Print detailed analysis with fixed-width directory field.
-    let mut total_by_language: HashMap<String, (u64, LanguageStats)> = HashMap::new();
-    let mut sorted_stats: Vec<_> = stats.iter().collect();
-    sorted_stats.sort_by(|(a, _), (b, _)| a.to_string_lossy().cmp(&b.to_string_lossy()));
-
-    println!("\n\nDetailed source code analysis:");
-    println!("{}", "-".repeat(112));
-    println!(
-        "{:<40} {:<width$} {:>8} {:>10} {:>10} {:>10} {:>10}",
-        "Directory",
-        "Language",
-        "Files",
-        "Code",
-        "Comments",
-        "Mixed",
-        "Blank",
-        width = LANG_WIDTH
+    let report = build_analysis_report(
+        &current_dir,
+        &stats,
+        files_processed,
+        lines_processed,
+        error_count,
     );
-    println!("{}", "-".repeat(112));
-
-    for (path, dir_stats) in &sorted_stats {
-        // Use a reference to avoid unnecessary string cloning
-        let raw_display = match path.strip_prefix(&current_dir) {
-            Ok(p) if p.as_os_str().is_empty() => ".",
-            Ok(p) => p.to_str().unwrap_or(path.to_str().unwrap_or("")),
-            Err(_) => path.to_str().unwrap_or(""),
-        };
-
-        // Truncate the directory name from the start if it is too long.
-        let display_path = truncate_start(raw_display, DIR_WIDTH);
-
-        let mut languages: Vec<_> = dir_stats.language_stats.iter().collect();
-        languages.sort_by(|(a, _), (b, _)| a.cmp(b));
-
-        for (lang, (file_count, lang_stats)) in &languages {
-            print_language_stats(&display_path, lang, *file_count, lang_stats);
-
-            let (total_count, total_stats) = total_by_language
-                .entry(lang.to_string())
-                .or_insert((0, LanguageStats::default()));
-            *total_count += file_count;
-            total_stats.code_lines += lang_stats.code_lines;
-            total_stats.comment_lines += lang_stats.comment_lines;
-            total_stats.blank_lines += lang_stats.blank_lines;
-            total_stats.overlap_lines += lang_stats.overlap_lines;
-        }
-    }
-
-    println!("{:-<112}", "");
-    println!("Totals by language:");
-
-    let mut sorted_totals: Vec<_> = total_by_language.iter().collect();
-    sorted_totals.sort_by(|(a, _), (b, _)| a.cmp(b));
-
-    for (lang, (file_count, stats)) in sorted_totals {
-        print_language_stats("", lang, *file_count, stats);
-    }
-
-    let mut grand_total = LanguageStats::default();
-
-    for (_, (_files, stats)) in total_by_language.iter() {
-        grand_total.code_lines += stats.code_lines;
-        grand_total.comment_lines += stats.comment_lines;
-        grand_total.blank_lines += stats.blank_lines;
-        grand_total.overlap_lines += stats.overlap_lines;
-    }
-
-    if files_processed > 0 || lines_processed > 0 {
-        println!("\n{}", "Overall Summary:".blue().bold());
-        println!(
-            "Total files processed: {}",
-            files_processed.to_string().bright_yellow()
-        );
-        println!(
-            "Total lines processed: {}",
-            lines_processed.to_string().bright_yellow()
-        );
-        println!(
-            "Code lines:     {} ({})",
-            grand_total.code_lines.to_string().bright_yellow(),
-            format!(
-                "{:.1}%",
-                safe_percentage(grand_total.code_lines, lines_processed)
-            )
-            .bright_yellow()
-        );
-        println!(
-            "Comment lines:  {} ({})",
-            grand_total.comment_lines.to_string().bright_yellow(),
-            format!(
-                "{:.1}%",
-                safe_percentage(grand_total.comment_lines, lines_processed)
-            )
-            .bright_yellow()
-        );
-        println!(
-            "Mixed lines:    {} ({})",
-            grand_total.overlap_lines.to_string().bright_yellow(),
-            format!(
-                "{:.1}%",
-                safe_percentage(grand_total.overlap_lines, lines_processed)
-            )
-            .bright_yellow()
-        );
-        println!(
-            "Blank lines:    {} ({})",
-            grand_total.blank_lines.to_string().bright_yellow(),
-            format!(
-                "{:.1}%",
-                safe_percentage(grand_total.blank_lines, lines_processed)
-            )
-            .bright_yellow()
-        );
-
-        if error_count > 0 {
-            println!(
-                "\n{}: {}",
-                "Warning".red().bold(),
-                error_count.to_string().bright_yellow()
-            );
-        }
-    }
+    print!("{}", report);
 
     Ok(())
 }
@@ -2191,8 +2368,10 @@ fn run_cli_with_metrics(args: Args, metrics: &mut PerformanceMetrics) -> io::Res
 mod tests {
     use super::*;
     use colored::control;
+    use std::env;
     use std::fs::{self, File};
     use std::io::{self, Write};
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tempfile::TempDir;
@@ -2218,6 +2397,62 @@ mod tests {
         let mut file = File::create(path)?;
         write!(file, "{}", content)?;
         Ok(())
+    }
+
+    struct CurrentDirGuard {
+        original: PathBuf,
+    }
+
+    impl CurrentDirGuard {
+        fn change_to(path: &Path) -> io::Result<Self> {
+            let original = env::current_dir()?;
+            env::set_current_dir(path)?;
+            Ok(Self { original })
+        }
+    }
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            let _ = env::set_current_dir(&self.original);
+        }
+    }
+
+    #[test]
+    fn test_lossy_line_reader_surfaces_errors() {
+        struct FailAfterFirstRead {
+            state: u8,
+        }
+
+        impl Read for FailAfterFirstRead {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                match self.state {
+                    0 => {
+                        let data = b"ok\n";
+                        let len = data.len().min(buf.len());
+                        buf[..len].copy_from_slice(&data[..len]);
+                        self.state = 1;
+                        Ok(len)
+                    }
+                    1 => {
+                        self.state = 2;
+                        Err(io::Error::new(io::ErrorKind::Other, "simulated failure"))
+                    }
+                    _ => Ok(0),
+                }
+            }
+        }
+
+        let mut reader = LossyLineReader::with_reader(FailAfterFirstRead { state: 0 });
+        let first_line = reader
+            .next()
+            .expect("expected first item")
+            .expect("first read should succeed");
+        assert_eq!(first_line, "ok");
+        let second = reader.next().expect("expected error result");
+        assert!(
+            second.is_err(),
+            "lossy reader should surface the simulated failure"
+        );
     }
 
     #[test]
@@ -2282,6 +2517,253 @@ mod tests {
     }
 
     #[test]
+    fn test_count_lines_with_stats_hcl_ini_combo() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "mixed.tf",
+            "resource \"x\" \"y\" {\n  attr = 1 /* block */ attr2 = 2 # trailing hash\n}\n",
+        )?;
+        create_test_file(
+            temp_dir.path(),
+            "mixed.ini",
+            "# heading\n[core]\nkey=value\nvalue2 = 2 # inline note\n; footer\n",
+        )?;
+
+        let (hcl_stats, _total_lines) = count_lines_with_stats(&temp_dir.path().join("mixed.tf"))?;
+        assert!(
+            hcl_stats.code_lines >= 4,
+            "expect code before block, after block, and braces: {hcl_stats:?}"
+        );
+        assert!(
+            hcl_stats.comment_lines >= 2,
+            "expect both block and hash comments counted: {hcl_stats:?}"
+        );
+
+        let (ini_stats, _total_lines) = count_lines_with_stats(&temp_dir.path().join("mixed.ini"))?;
+        assert_eq!(
+            ini_stats.comment_lines, 2,
+            "expect leading # and trailing ; lines as comments: {ini_stats:?}"
+        );
+        assert_eq!(
+            ini_stats.code_lines, 3,
+            "expect [core], key=value, and inline hash line as code: {ini_stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_count_lines_with_stats_uppercase_ini() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "CONFIG.INI",
+            "# heading\n[Core]\nvalue=1\n",
+        )?;
+        let (stats, _total_lines) = count_lines_with_stats(&temp_dir.path().join("CONFIG.INI"))?;
+        assert_eq!(stats.comment_lines, 1, "stats: {:?}", stats);
+        assert_eq!(stats.code_lines, 2, "stats: {:?}", stats);
+        assert_eq!(stats.blank_lines, 0, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_count_lines_with_stats_uppercase_cfg() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(temp_dir.path(), "SETTINGS.CFG", "# heading\noption=value\n")?;
+        let (stats, _total_lines) = count_lines_with_stats(&temp_dir.path().join("SETTINGS.CFG"))?;
+        assert_eq!(stats.comment_lines, 1, "stats: {:?}", stats);
+        assert_eq!(stats.code_lines, 1, "stats: {:?}", stats);
+        assert_eq!(stats.blank_lines, 0, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_count_lines_with_stats_uppercase_tfvars() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(temp_dir.path(), "variables.TFVARS", "# note\nvalue = 1\n")?;
+        let (stats, _total_lines) =
+            count_lines_with_stats(&temp_dir.path().join("variables.TFVARS"))?;
+        assert_eq!(stats.comment_lines, 1, "stats: {:?}", stats);
+        assert_eq!(stats.code_lines, 1, "stats: {:?}", stats);
+        assert_eq!(stats.blank_lines, 0, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_count_lines_with_stats_uppercase_conf() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "SAMPLE.CONF",
+            "# heading\n[section]\nvalue=1\n",
+        )?;
+        let (stats, _total_lines) = count_lines_with_stats(&temp_dir.path().join("SAMPLE.CONF"))?;
+        assert_eq!(stats.comment_lines, 1, "stats: {:?}", stats);
+        assert_eq!(stats.code_lines, 2, "stats: {:?}", stats);
+        assert_eq!(stats.blank_lines, 0, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_count_lines_with_stats_tfvars_json_dispatch() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "terraform.tfvars.json",
+            "{\n  \"value\": 1,\n  \"flag\": true\n}\n",
+        )?;
+        let (stats, total_lines) =
+            count_lines_with_stats(&temp_dir.path().join("terraform.tfvars.json"))?;
+        assert_eq!(total_lines, 4);
+        assert_eq!(stats.code_lines, 4, "stats: {:?}", stats);
+        assert_eq!(stats.comment_lines, 0, "stats: {:?}", stats);
+        assert_eq!(stats.blank_lines, 0, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_count_lines_with_stats_upper_tfvars_json_dispatch() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "variables.TFVARS.JSON",
+            "{\n  \"enabled\": true\n}\n",
+        )?;
+        let (stats, total_lines) =
+            count_lines_with_stats(&temp_dir.path().join("variables.TFVARS.JSON"))?;
+        assert_eq!(total_lines, 3);
+        assert_eq!(stats.code_lines, 3, "stats: {:?}", stats);
+        assert_eq!(stats.comment_lines, 0, "stats: {:?}", stats);
+        assert_eq!(stats.blank_lines, 0, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_count_lines_with_stats_tfvars_json_case() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "variables.TfVars.json",
+            "{\n  \"value\": 1,\n  \"enabled\": true\n}\n",
+        )?;
+        let (stats, _total_lines) =
+            count_lines_with_stats(&temp_dir.path().join("variables.TfVars.json"))?;
+        assert_eq!(stats.comment_lines, 0, "stats: {:?}", stats);
+        assert_eq!(stats.code_lines, 4, "stats: {:?}", stats);
+        assert_eq!(stats.blank_lines, 0, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_count_lines_with_stats_tfvars_json_backup_extension() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "variables.tfvars.json.bak",
+            "{\n  \"value\": 1\n}\n",
+        )?;
+        let (stats, total_lines) =
+            count_lines_with_stats(&temp_dir.path().join("variables.tfvars.json.bak"))?;
+        assert_eq!(total_lines, 3);
+        assert_eq!(
+            stats.code_lines, 3,
+            "generic handler should count non-blank lines as code: {stats:?}"
+        );
+        assert_eq!(stats.comment_lines, 0, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_count_lines_with_stats_tfvars_json_backup_mixed_case() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "Terraform.TfVars.JSON.BAK",
+            "{\n  \"enabled\": true\n}\n",
+        )?;
+        let (stats, total_lines) =
+            count_lines_with_stats(&temp_dir.path().join("Terraform.TfVars.JSON.BAK"))?;
+        assert_eq!(total_lines, 3);
+        assert_eq!(
+            stats.code_lines, 3,
+            "mixed-case backup should still count lines as generic: {stats:?}"
+        );
+        assert_eq!(stats.comment_lines, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_count_lines_with_stats_tfvars_json_extra_suffix() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "variables.tfvars.Json.bak.old",
+            "{\n  \"value\": 1\n}\n",
+        )?;
+        let (stats, total_lines) =
+            count_lines_with_stats(&temp_dir.path().join("variables.tfvars.Json.bak.old"))?;
+        assert_eq!(total_lines, 3);
+        assert_eq!(stats.code_lines, 3, "stats: {:?}", stats);
+        assert_eq!(stats.comment_lines, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_count_lines_with_stats_tfvars_json_backup_suffix() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "config.TfVars.JSON.backup",
+            "{\n  \"enabled\": false\n}\n",
+        )?;
+        let (stats, total_lines) =
+            count_lines_with_stats(&temp_dir.path().join("config.TfVars.JSON.backup"))?;
+        assert_eq!(total_lines, 3);
+        assert_eq!(
+            stats.code_lines, 3,
+            "backup suffix should fall back to generic counting: {stats:?}"
+        );
+        assert_eq!(stats.comment_lines, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_count_lines_with_stats_tfvars_json_tmp_backup_chain() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "vars.tfvars.json.tmp.backup",
+            "{\n  \"value\": 2\n}\n",
+        )?;
+        let (stats, total_lines) =
+            count_lines_with_stats(&temp_dir.path().join("vars.tfvars.json.tmp.backup"))?;
+        assert_eq!(total_lines, 3);
+        assert_eq!(
+            stats.code_lines, 3,
+            "tmp backup chain should count as generic"
+        );
+        assert_eq!(stats.comment_lines, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_count_lines_with_stats_tfvars_json_tilde_backup() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "vars.tfvars.json~",
+            "{\n  \"value\": 3\n}\n",
+        )?;
+        let (stats, total_lines) =
+            count_lines_with_stats(&temp_dir.path().join("vars.tfvars.json~"))?;
+        assert_eq!(total_lines, 3);
+        assert_eq!(stats.code_lines, 3, "stats: {:?}", stats);
+        assert_eq!(stats.comment_lines, 0);
+        Ok(())
+    }
+
+    #[test]
     fn test_count_lines_with_stats_powershell() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
@@ -2293,6 +2775,89 @@ mod tests {
         assert!(
             stats.code_lines >= 2 && stats.comment_lines >= 1,
             "powershell stats: {:?}",
+            stats
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_count_lines_with_stats_algol_dispatch() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "sample.alg",
+            "begin\nCOMMENT demo;\nco middle co\n# inline\nend\n",
+        )?;
+        let (stats, total) = count_lines_with_stats(&temp_dir.path().join("sample.alg"))?;
+        assert_eq!(total, 5);
+        assert_eq!(stats.code_lines, 2, "algol code stats: {:?}", stats);
+        assert_eq!(stats.comment_lines, 3, "algol comment stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_count_lines_with_stats_cobol_dispatch() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "example.cob",
+            "       IDENTIFICATION DIVISION.\n000000 WORKING-STORAGE SECTION.\n      * COMMENT LINE\n      / ANOTHER COMMENT\nPROCEDURE DIVISION.\n",
+        )?;
+        let (stats, total) = count_lines_with_stats(&temp_dir.path().join("example.cob"))?;
+        assert_eq!(total, 5);
+        assert_eq!(stats.code_lines, 3, "cobol code stats: {:?}", stats);
+        assert_eq!(stats.comment_lines, 2, "cobol comment stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_count_lines_with_stats_fortran_dispatch() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "program.f90",
+            "      PROGRAM HELLO\nC FIXED COMMENT\n      PRINT *, 'HI' ! inline\n      END\n",
+        )?;
+        let (stats, total) = count_lines_with_stats(&temp_dir.path().join("program.f90"))?;
+        assert_eq!(total, 4);
+        assert_eq!(stats.code_lines, 3, "fortran code stats: {:?}", stats);
+        assert_eq!(stats.comment_lines, 2, "fortran comment stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_count_lines_with_stats_velocity_dispatch() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "template.vm",
+            "#foreach($i in [1])\n#* block comment *#\n## inline note\n$foo\n",
+        )?;
+        let (stats, total) = count_lines_with_stats(&temp_dir.path().join("template.vm"))?;
+        assert_eq!(total, 4);
+        assert_eq!(stats.code_lines, 2, "velocity code stats: {:?}", stats);
+        assert_eq!(
+            stats.comment_lines, 2,
+            "velocity comment stats: {:?}",
+            stats
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_count_lines_with_stats_mustache_dispatch() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "view.mustache",
+            "Hello {{! single-line }} World\n{{! multi\nline\n}}\n{{name}}\n",
+        )?;
+        let (stats, total) = count_lines_with_stats(&temp_dir.path().join("view.mustache"))?;
+        assert_eq!(total, 5);
+        assert_eq!(stats.code_lines, 3, "mustache code stats: {:?}", stats);
+        assert_eq!(
+            stats.comment_lines, 4,
+            "mustache comment stats: {:?}",
             stats
         );
         Ok(())
@@ -2320,6 +2885,47 @@ mod tests {
 
         assert!(stats.is_empty());
         assert_eq!(error_count, 1);
+        assert_eq!(entries_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_process_file_verbose_prints_stats() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "verbose.rs",
+            "fn main() {}\n// comment line\n",
+        )?;
+
+        let mut args = test_args();
+        args.verbose = true;
+        let mut metrics = test_metrics();
+        let mut stats = std::collections::HashMap::new();
+        let mut entries_count = 0usize;
+        let mut error_count = 0usize;
+
+        process_file(
+            &temp_dir.path().join("verbose.rs"),
+            &args,
+            temp_dir.path(),
+            &mut metrics,
+            &mut stats,
+            &mut entries_count,
+            &mut error_count,
+            None,
+        )?;
+
+        let dir_stats = stats
+            .get(temp_dir.path())
+            .expect("verbose scan should record directory stats");
+        let (file_count, lang_stats) = dir_stats
+            .language_stats
+            .get("Rust")
+            .expect("expected Rust stats for verbose file");
+        assert_eq!(*file_count, 1);
+        assert!(lang_stats.code_lines >= 1);
+        assert_eq!(error_count, 0);
         assert_eq!(entries_count, 1);
         Ok(())
     }
@@ -2425,6 +3031,74 @@ mod tests {
     }
 
     #[test]
+    fn test_run_cli_with_metrics_emits_progress_output() -> io::Result<()> {
+        control::set_override(false);
+        let temp_dir = TempDir::new()?;
+        for idx in 0..5 {
+            create_test_file(
+                temp_dir.path(),
+                &format!("file{idx}.rs"),
+                "fn main() {}\n// comment\n",
+            )?;
+        }
+        let args = Args::parse_from([
+            "mdkloc",
+            temp_dir
+                .path()
+                .to_str()
+                .expect("temp dir path should be valid UTF-8"),
+            "--non-recursive",
+        ]);
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = CaptureWriter::new(buffer.clone());
+        let mut metrics = PerformanceMetrics::with_writer(Box::new(writer), true);
+        metrics.last_update = metrics.start_time - Duration::from_secs(2);
+        run_cli_with_metrics(args, &mut metrics)?;
+        let progress_output = CaptureWriter::into_string(buffer);
+        assert!(
+            progress_output.contains("Processed"),
+            "expected progress output, got: {progress_output}"
+        );
+        assert!(
+            progress_output.contains("files/sec"),
+            "expected progress rate information, got: {progress_output}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_cli_with_metrics_zero_files() -> io::Result<()> {
+        control::set_override(false);
+        let temp_dir = TempDir::new()?;
+        let args = Args::parse_from([
+            "mdkloc",
+            temp_dir
+                .path()
+                .to_str()
+                .expect("temp dir path should be valid UTF-8"),
+            "--non-recursive",
+        ]);
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = CaptureWriter::new(buffer.clone());
+        let mut metrics = PerformanceMetrics::with_writer(Box::new(writer), false);
+        run_cli_with_metrics(args, &mut metrics)?;
+        let output = CaptureWriter::into_string(buffer);
+        assert!(
+            output.contains("Performance Summary"),
+            "zero-file run should still display performance summary: {output}"
+        );
+        assert!(
+            output.contains("Files processed"),
+            "zero-file run should report file count: {output}"
+        );
+        assert!(
+            output.contains("Lines processed"),
+            "zero-file run should report line count: {output}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_run_cli_with_metrics_missing_path() {
         control::set_override(false);
         let missing = TempDir::new()
@@ -2497,6 +3171,30 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_stats_reduces_blank_lines_before_overlap() {
+        let stats = LanguageStats {
+            code_lines: 2,
+            comment_lines: 1,
+            blank_lines: 3,
+            overlap_lines: 0,
+        };
+        let normalized = normalize_stats(stats, 4);
+        assert_eq!(
+            normalized.code_lines + normalized.comment_lines + normalized.blank_lines
+                - normalized.overlap_lines,
+            4
+        );
+        assert_eq!(
+            normalized.blank_lines, 1,
+            "expected blank lines to shrink before overlap is recorded"
+        );
+        assert_eq!(
+            normalized.overlap_lines, 0,
+            "blank line reduction should consume the overlap delta"
+        );
+    }
+
+    #[test]
     fn test_normalize_stats_does_not_inflate_when_zero_sum() {
         let stats = LanguageStats {
             code_lines: 0,
@@ -2508,6 +3206,27 @@ mod tests {
         assert_eq!(normalized.code_lines, 0);
         assert_eq!(normalized.comment_lines, 0);
         assert_eq!(normalized.blank_lines, 0);
+        assert_eq!(normalized.overlap_lines, 0);
+    }
+
+    #[test]
+    fn test_normalize_stats_backfills_blank_lines_when_underflow() {
+        let stats = LanguageStats {
+            code_lines: 2,
+            comment_lines: 1,
+            blank_lines: 0,
+            overlap_lines: 0,
+        };
+        let normalized = normalize_stats(stats, 6);
+        assert_eq!(
+            normalized.code_lines + normalized.comment_lines + normalized.blank_lines
+                - normalized.overlap_lines,
+            6
+        );
+        assert_eq!(
+            normalized.blank_lines, 3,
+            "expected blank lines to expand to match the total when sum < total_lines"
+        );
         assert_eq!(normalized.overlap_lines, 0);
     }
 
@@ -2608,6 +3327,1506 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_directory_metadata_error_increments_error() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        let sentinel = root.join(super::METADATA_FAIL_TAG);
+        fs::create_dir(&sentinel)?;
+
+        let mut metrics = test_metrics();
+        let mut entries_count = 0usize;
+        let mut error_count = 0usize;
+        let stats = scan_directory(
+            root,
+            &test_args(),
+            root,
+            &mut metrics,
+            0,
+            &mut entries_count,
+            &mut error_count,
+        )?;
+
+        assert!(
+            stats.is_empty(),
+            "metadata failure should skip directory stats entirely"
+        );
+        assert!(
+            error_count >= 1,
+            "metadata failure should increment error count, got {error_count}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_directory_metadata_failure_keeps_sibling() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        let good_dir = root.join("good");
+        fs::create_dir(&good_dir)?;
+        create_test_file(&good_dir, "main.rs", "fn main() {}\n")?;
+
+        let sentinel = root.join(super::METADATA_FAIL_TAG);
+        fs::create_dir(&sentinel)?;
+
+        let mut metrics = test_metrics();
+        let mut entries = 0usize;
+        let mut errors = 0usize;
+        let stats = scan_directory(
+            root,
+            &test_args(),
+            root,
+            &mut metrics,
+            0,
+            &mut entries,
+            &mut errors,
+        )?;
+
+        assert!(errors >= 1, "metadata failure should increment errors");
+        let good_key = fs::canonicalize(&good_dir)?;
+        assert!(
+            stats.contains_key(&good_key),
+            "sibling directory should remain in stats after metadata failure"
+        );
+        assert!(
+            !stats.contains_key(&fs::canonicalize(&sentinel)?),
+            "metadata failure directory should be skipped in stats"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_directory_read_dir_error_increments_error() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        let sentinel = root.join(super::READ_DIR_FAIL_TAG);
+        fs::create_dir(&sentinel)?;
+
+        let mut metrics = test_metrics();
+        let mut entries_count = 0usize;
+        let mut error_count = 0usize;
+        let stats = scan_directory(
+            root,
+            &test_args(),
+            root,
+            &mut metrics,
+            0,
+            &mut entries_count,
+            &mut error_count,
+        )?;
+
+        assert!(
+            !stats.contains_key(&fs::canonicalize(&sentinel)?),
+            "read_dir failure should prevent stats for the directory"
+        );
+        assert!(
+            error_count >= 1,
+            "read_dir failure should increment error count, got {error_count}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_directory_entry_iteration_error_is_counted() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        let sentinel = root.join(super::ENTRY_ITER_FAIL_TAG);
+        fs::create_dir(&sentinel)?;
+        create_test_file(&sentinel, "ok.rs", "fn main() {}\n")?;
+
+        let mut metrics = test_metrics();
+        let mut entries_count = 0usize;
+        let mut error_count = 0usize;
+        let stats = scan_directory(
+            root,
+            &test_args(),
+            root,
+            &mut metrics,
+            0,
+            &mut entries_count,
+            &mut error_count,
+        )?;
+
+        let sentinel_canon = fs::canonicalize(&sentinel)?;
+        let dir_stats = stats
+            .get(&sentinel_canon)
+            .or_else(|| stats.get(&sentinel))
+            .expect("directory stats should exist after iteration error");
+        assert!(
+            dir_stats.language_stats.contains_key("Rust"),
+            "expected Rust stats even after iteration error"
+        );
+        assert!(
+            error_count >= 1,
+            "iteration error should increment error count, got {error_count}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_directory_alternating_success_failure_deeper() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+
+        // Healthy root file to ensure overall stats persist.
+        create_test_file(root, "root.rs", "fn root() {}\n")?;
+
+        // Level 1 alternating: success directory with nested failure and healthy leaves.
+        let level1_ok = root.join("level1_ok");
+        fs::create_dir(&level1_ok)?;
+        create_test_file(&level1_ok, "ok.rs", "fn ok_level1() {}\n")?;
+
+        let entry_fail = level1_ok.join(super::ENTRY_ITER_FAIL_TAG);
+        fs::create_dir(&entry_fail)?;
+        create_test_file(&entry_fail, "entry.rs", "fn entry() {}\n")?;
+
+        let nested_ok = entry_fail.join("nested_ok");
+        fs::create_dir(&nested_ok)?;
+        create_test_file(&nested_ok, "nested_ok.rs", "fn nested_ok() {}\n")?;
+
+        // Inject metadata failure in nested leaf.
+        let nested_meta = nested_ok.join(super::METADATA_FAIL_TAG);
+        fs::create_dir(&nested_meta)?;
+
+        // Alternate with read_dir failure deeper.
+        let nested_read_fail = entry_fail.join(super::READ_DIR_FAIL_TAG);
+        fs::create_dir(&nested_read_fail)?;
+
+        // Separate branch: metadata failure at root level.
+        let meta_fail_root = root.join(super::METADATA_FAIL_TAG);
+        fs::create_dir(&meta_fail_root)?;
+
+        // Separate branch: read_dir failure at root level.
+        let read_fail_root = root.join(super::READ_DIR_FAIL_TAG);
+        fs::create_dir(&read_fail_root)?;
+
+        // Separate branch: file_type failure at root level.
+        let _file_type_fail_root = root.join(super::FILE_TYPE_FAIL_TAG);
+        create_test_file(&root, super::FILE_TYPE_FAIL_TAG, "fn file_fail() {}\n")?;
+
+        // Healthy sibling to ensure stats persist.
+        let healthy = root.join("healthy");
+        fs::create_dir(&healthy)?;
+        create_test_file(&healthy, "healthy.rs", "fn healthy() {}\n")?;
+
+        let mut metrics = test_metrics();
+        let mut entries = 0usize;
+        let mut errors = 0usize;
+        let stats = scan_directory(
+            root,
+            &test_args(),
+            root,
+            &mut metrics,
+            0,
+            &mut entries,
+            &mut errors,
+        )?;
+
+        assert!(
+            errors >= 4,
+            "expected alternating metadata/read_dir/entry/file_type failures to increment errors: {errors}"
+        );
+
+        let healthy_key = fs::canonicalize(&healthy)?;
+        assert!(
+            stats.contains_key(&healthy_key),
+            "healthy directory should remain in stats after alternating failures"
+        );
+
+        let entry_key = fs::canonicalize(&entry_fail)?;
+        let entry_stats = stats
+            .get(&entry_key)
+            .or_else(|| stats.get(&entry_fail))
+            .expect("entry iteration failure directory should retain stats");
+        assert!(
+            entry_stats.language_stats.contains_key("Rust"),
+            "entry iteration failure directory should keep Rust stats: {entry_stats:?}"
+        );
+
+        assert!(
+            !stats.contains_key(&fs::canonicalize(&meta_fail_root)?),
+            "metadata failure directory should be excluded from stats"
+        );
+        assert!(
+            !stats.contains_key(&fs::canonicalize(&read_fail_root)?),
+            "read_dir failure directory should be excluded from stats"
+        );
+        assert!(
+            !stats.contains_key(&fs::canonicalize(&nested_meta)?),
+            "nested metadata failure directory should be excluded from stats"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_directory_file_type_error_skips_entry() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        create_test_file(root, super::FILE_TYPE_FAIL_TAG, "fn main() {}\n")?;
+
+        let mut metrics = test_metrics();
+        let mut entries_count = 0usize;
+        let mut error_count = 0usize;
+        let stats = scan_directory(
+            root,
+            &test_args(),
+            root,
+            &mut metrics,
+            0,
+            &mut entries_count,
+            &mut error_count,
+        )?;
+
+        assert!(
+            stats.is_empty(),
+            "file type failure should prevent stats accumulation"
+        );
+        assert!(
+            error_count >= 1,
+            "file type failure should increment error count, got {error_count}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_directory_nested_failure_permutations() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+
+        let good_level1 = root.join("good_l1");
+        fs::create_dir(&good_level1)?;
+        create_test_file(&good_level1, "main.rs", "fn main() {}\n")?;
+
+        let fail_level1 = root.join("fail_l1");
+        fs::create_dir(&fail_level1)?;
+
+        let metadata_fail = fail_level1.join(super::METADATA_FAIL_TAG);
+        fs::create_dir(&metadata_fail)?;
+
+        let read_dir_fail = fail_level1.join(super::READ_DIR_FAIL_TAG);
+        fs::create_dir(&read_dir_fail)?;
+
+        let entry_level2 = fail_level1.join(super::ENTRY_ITER_FAIL_TAG);
+        fs::create_dir(&entry_level2)?;
+        create_test_file(&entry_level2, "keep.rs", "fn keep() {}\n")?;
+
+        let entry_nested = entry_level2.join(super::ENTRY_ITER_FAIL_TAG);
+        fs::create_dir(&entry_nested)?;
+        create_test_file(&entry_nested, "nested.rs", "fn nested() {}\n")?;
+
+        let mut metrics = test_metrics();
+        let mut entries = 0usize;
+        let mut errors = 0usize;
+        let stats = scan_directory(
+            root,
+            &test_args(),
+            root,
+            &mut metrics,
+            0,
+            &mut entries,
+            &mut errors,
+        )?;
+
+        assert!(
+            errors >= 4,
+            "expected metadata, read_dir, and nested entry failures to increment errors: {errors}"
+        );
+
+        let good_key = fs::canonicalize(&good_level1)?;
+        assert!(
+            stats.contains_key(&good_key),
+            "good_l1 stats should remain despite sibling failures"
+        );
+
+        assert!(
+            !stats.contains_key(&fs::canonicalize(&metadata_fail)?),
+            "metadata failure directory should be absent from stats"
+        );
+
+        assert!(
+            !stats.contains_key(&fs::canonicalize(&read_dir_fail)?),
+            "read_dir failure directory should be absent from stats"
+        );
+
+        let entry_key = fs::canonicalize(&entry_level2)?;
+        let entry_stats = stats
+            .get(&entry_key)
+            .or_else(|| stats.get(&entry_level2))
+            .expect("ENTRY_ITER_FAIL_TAG directory should retain stats");
+        assert!(
+            entry_stats.language_stats.contains_key("Rust"),
+            "entry iteration directory should keep Rust stats despite simulated failure: {entry_stats:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_directory_mixed_failure_tree() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+
+        create_test_file(root, "root.rs", "fn root() {}\n")?;
+
+        let meta_fail = root.join(super::METADATA_FAIL_TAG);
+        fs::create_dir(&meta_fail)?;
+
+        let parent = root.join("parent");
+        fs::create_dir(&parent)?;
+
+        let read_fail = parent.join(super::READ_DIR_FAIL_TAG);
+        fs::create_dir(&read_fail)?;
+
+        let entry_dir = parent.join(super::ENTRY_ITER_FAIL_TAG);
+        fs::create_dir(&entry_dir)?;
+        create_test_file(&entry_dir, "ok.rs", "fn ok() {}\n")?;
+
+        let nested_meta = entry_dir.join(super::METADATA_FAIL_TAG);
+        fs::create_dir(&nested_meta)?;
+
+        create_test_file(&entry_dir, super::FILE_TYPE_FAIL_TAG, "fn bad() {}\n")?;
+
+        let mut metrics = test_metrics();
+        let mut entries = 0usize;
+        let mut errors = 0usize;
+        let mut stats = scan_directory(
+            root,
+            &test_args(),
+            root,
+            &mut metrics,
+            0,
+            &mut entries,
+            &mut errors,
+        )?;
+
+        assert!(
+            errors >= 4,
+            "expected combined failures (metadata/read_dir/entry/file_type) to increment errors: {errors}"
+        );
+
+        let root_key = fs::canonicalize(root)?;
+        if let Some(entry) = stats.remove(&root_key) {
+            stats.insert(root.to_path_buf(), entry);
+        }
+        let root_stats = stats
+            .get(&root_key)
+            .or_else(|| stats.get(root))
+            .expect("root stats should exist");
+        let root_has_rust = root_stats.language_stats.contains_key("Rust");
+        assert!(
+            root_has_rust,
+            "root stats should retain Rust counts even with failures: {root_stats:?}"
+        );
+
+        let meta_seen = stats.contains_key(&fs::canonicalize(&meta_fail)?);
+        assert!(
+            !meta_seen,
+            "metadata failure directory should be excluded from stats"
+        );
+        let read_seen = stats.contains_key(&fs::canonicalize(&read_fail)?);
+        assert!(
+            !read_seen,
+            "read_dir failure directory should be excluded from stats"
+        );
+        let nested_seen = stats.contains_key(&fs::canonicalize(&nested_meta)?);
+        assert!(
+            !nested_seen,
+            "nested metadata failure directory should be excluded from stats"
+        );
+
+        let entry_key = fs::canonicalize(&entry_dir)?;
+        if !stats.contains_key(&entry_key) {
+            if let Some(entry) = stats.remove(&entry_dir) {
+                stats.insert(entry_key.clone(), entry);
+            }
+        }
+        if let Some(entry) = stats.remove(&entry_key) {
+            stats.insert(entry_dir.clone(), entry);
+        }
+        let entry_stats = stats
+            .remove(&entry_key)
+            .or_else(|| stats.remove(&entry_dir))
+            .expect("entry iteration directory stats should be present");
+        let entry_has_rust = entry_stats.language_stats.contains_key("Rust");
+        assert!(
+            entry_has_rust,
+            "entry iteration directory should keep Rust stats despite failures: {entry_stats:?}"
+        );
+        stats.insert(entry_dir.clone(), entry_stats);
+        let lookup = stats
+            .get(&entry_key)
+            .or_else(|| stats.get(&entry_dir))
+            .expect("fallback should locate entry iteration stats after reinsertion");
+        assert!(
+            lookup.language_stats.contains_key("Rust"),
+            "fallback lookup should still expose Rust stats: {lookup:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_directory_duplicate_canonical_merge() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        let shared = root.join("shared");
+        fs::create_dir(&shared)?;
+        create_test_file(&shared, "one.rs", "fn one() {}\n")?;
+
+        let mut metrics = test_metrics();
+        let mut entries = 0usize;
+        let mut errors = 0usize;
+        let mut merged: HashMap<PathBuf, DirectoryStats> = HashMap::new();
+
+        for _ in 0..2 {
+            let sub_stats = scan_directory_impl(
+                &shared,
+                &test_args(),
+                root,
+                &mut metrics,
+                1,
+                &mut entries,
+                &mut errors,
+                None,
+            )?;
+            for (dir, stat) in sub_stats {
+                merge_directory_stats(&mut merged, dir, stat);
+            }
+        }
+
+        assert_eq!(errors, 0, "duplicate merge should not introduce errors");
+        assert!(
+            entries >= 2,
+            "expected entries counter to reflect duplicate scans: {entries}"
+        );
+
+        let shared_key = fs::canonicalize(&shared)?;
+        let shared_stats = merged
+            .get(&shared_key)
+            .or_else(|| merged.get(&shared))
+            .expect("shared directory stats should exist after merging duplicates");
+        let rust_entry = shared_stats
+            .language_stats
+            .get("Rust")
+            .expect("Rust stats should be present after merge");
+        assert_eq!(
+            rust_entry.0, 2,
+            "expected file count to accumulate across duplicate merges: {rust_entry:?}"
+        );
+        assert_eq!(
+            rust_entry.1.code_lines, 2,
+            "code lines should accumulate across duplicate merges: {rust_entry:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_directory_alternating_failures() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+
+        // top-level good artifact
+        create_test_file(root, "main.rs", "fn main() {}\n")?;
+
+        // first-level directory that will fail read_dir
+        let fail_dir = root.join("fail_dir");
+        fs::create_dir(&fail_dir)?;
+        let read_dir_fail = fail_dir.join(super::READ_DIR_FAIL_TAG);
+        fs::create_dir(&read_dir_fail)?;
+
+        // sibling directory that succeeds but contains a nested entry iteration failure
+        let ok_dir = root.join("ok_dir");
+        fs::create_dir(&ok_dir)?;
+        create_test_file(&ok_dir, "ok.rs", "fn ok() {}\n")?;
+        let entry_fail = ok_dir.join(super::ENTRY_ITER_FAIL_TAG);
+        fs::create_dir(&entry_fail)?;
+        create_test_file(&entry_fail, "entry.rs", "fn entry() {}\n")?;
+
+        // nested metadata failure beneath the entry iteration failure
+        let nested_meta = entry_fail.join(super::METADATA_FAIL_TAG);
+        fs::create_dir(&nested_meta)?;
+
+        let mut metrics = test_metrics();
+        let mut entries = 0usize;
+        let mut errors = 0usize;
+        let mut stats = scan_directory(
+            root,
+            &test_args(),
+            root,
+            &mut metrics,
+            0,
+            &mut entries,
+            &mut errors,
+        )?;
+
+        assert!(
+            errors >= 3,
+            "expected read_dir, entry iteration, and nested metadata failures to increment errors: {errors}"
+        );
+
+        let root_key = fs::canonicalize(root)?;
+        if let Some(entry) = stats.remove(&root_key) {
+            stats.insert(root.to_path_buf(), entry);
+        }
+        let root_stats = stats
+            .get(&root_key)
+            .or_else(|| stats.get(root))
+            .expect("root stats should exist after alternating failures");
+        let root_has_rust = root_stats.language_stats.contains_key("Rust");
+        assert!(
+            root_has_rust,
+            "root stats should retain Rust counts despite alternating failures: {root_stats:?}"
+        );
+
+        let read_excluded = stats.contains_key(&fs::canonicalize(&read_dir_fail)?);
+        assert!(
+            !read_excluded,
+            "read_dir failure directory should be excluded from stats"
+        );
+        let nested_excluded = stats.contains_key(&fs::canonicalize(&nested_meta)?);
+        assert!(
+            !nested_excluded,
+            "nested metadata failure directory should be excluded from stats"
+        );
+
+        let entry_key = fs::canonicalize(&entry_fail)?;
+        if !stats.contains_key(&entry_key) {
+            if let Some(entry) = stats.remove(&entry_fail) {
+                stats.insert(entry_key.clone(), entry);
+            }
+        }
+        if let Some(entry) = stats.remove(&entry_key) {
+            stats.insert(entry_fail.clone(), entry);
+        }
+        let entry_stats = stats
+            .remove(&entry_key)
+            .or_else(|| stats.remove(&entry_fail))
+            .expect("entry iteration directory stats should be present after mixed failures");
+        let entry_has_rust = entry_stats.language_stats.contains_key("Rust");
+        assert!(
+            entry_has_rust,
+            "entry iteration directory should keep Rust stats despite failures: {entry_stats:?}"
+        );
+        stats.insert(entry_fail.clone(), entry_stats);
+        let entry_lookup = stats
+            .get(&entry_key)
+            .or_else(|| stats.get(&entry_fail))
+            .expect("fallback should locate entry iteration stats after reinsertion");
+        assert!(
+            entry_lookup.language_stats.contains_key("Rust"),
+            "fallback lookup should retain Rust stats: {entry_lookup:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_directory_canonical_fallback_alias_key() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+
+        let alias_dir = root.join("alias_dir");
+        fs::create_dir(&alias_dir)?;
+        create_test_file(&alias_dir, "lib.rs", "fn lib() {}\n")?;
+
+        let mut metrics = test_metrics();
+        let mut entries = 0usize;
+        let mut errors = 0usize;
+        let mut stats = scan_directory(
+            root,
+            &test_args(),
+            root,
+            &mut metrics,
+            0,
+            &mut entries,
+            &mut errors,
+        )?;
+
+        assert_eq!(errors, 0, "expected scan without errors");
+        assert!(
+            entries >= 1,
+            "expected at least one entry processed for alias directory: {entries}"
+        );
+
+        let canonical = fs::canonicalize(&alias_dir)?;
+        let alias_stats = stats
+            .remove(&canonical)
+            .expect("expected canonical entry for alias directory");
+        stats.insert(alias_dir.clone(), alias_stats);
+
+        let fallback_stats = stats
+            .remove(&canonical)
+            .or_else(|| stats.remove(&alias_dir))
+            .expect("fallback should retrieve stats when canonical key is missing");
+        assert!(
+            fallback_stats.language_stats.contains_key("Rust"),
+            "alias directory stats should retain Rust counts after fallback: {fallback_stats:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_directory_deeper_alternating_failures() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+
+        create_test_file(root, "root.rs", "fn root() {}\n")?;
+
+        // Healthy sibling to ensure good stats persist.
+        let healthy = root.join("healthy");
+        fs::create_dir(&healthy)?;
+        create_test_file(&healthy, "ok.rs", "fn ok() {}\n")?;
+
+        // First alternating branch: success dir containing entry failure that alternates deeper.
+        let level1_ok = root.join("level1_ok");
+        fs::create_dir(&level1_ok)?;
+        create_test_file(&level1_ok, "ok.rs", "fn ok_level1() {}\n")?;
+
+        let entry_fail_level1 = level1_ok.join(super::ENTRY_ITER_FAIL_TAG);
+        fs::create_dir(&entry_fail_level1)?;
+        create_test_file(&entry_fail_level1, "entry_l1.rs", "fn entry_l1() {}\n")?;
+
+        // Nested healthy dir under the entry failure to keep stats.
+        let nested_ok = entry_fail_level1.join("nested_ok");
+        fs::create_dir(&nested_ok)?;
+        create_test_file(&nested_ok, "nested_ok.rs", "fn nested_ok() {}\n")?;
+
+        // Alternate with a deeper entry failure that contains both metadata and file type sentinels.
+        let deep_entry_fail = nested_ok.join(super::ENTRY_ITER_FAIL_TAG);
+        fs::create_dir(&deep_entry_fail)?;
+        create_test_file(&deep_entry_fail, "deep_entry.rs", "fn deep_entry() {}\n")?;
+        create_test_file(
+            &deep_entry_fail,
+            super::FILE_TYPE_FAIL_TAG,
+            "fn should_fail() {}\n",
+        )?;
+        let deep_meta_fail = deep_entry_fail.join(super::METADATA_FAIL_TAG);
+        fs::create_dir(&deep_meta_fail)?;
+
+        // Inject a read_dir failure alongside the healthy directory to continue alternating.
+        let nested_read_fail = entry_fail_level1.join(super::READ_DIR_FAIL_TAG);
+        fs::create_dir(&nested_read_fail)?;
+
+        // Second alternating branch: immediate read_dir failure at level 1.
+        let level1_read_fail = root.join("level1_read_fail");
+        fs::create_dir(&level1_read_fail)?;
+        let level1_read_sentinel = level1_read_fail.join(super::READ_DIR_FAIL_TAG);
+        fs::create_dir(&level1_read_sentinel)?;
+
+        let mut metrics = test_metrics();
+        let mut entries = 0usize;
+        let mut errors = 0usize;
+        let mut stats = scan_directory(
+            root,
+            &test_args(),
+            root,
+            &mut metrics,
+            0,
+            &mut entries,
+            &mut errors,
+        )?;
+
+        assert!(
+            errors >= 5,
+            "expected alternating read_dir, entry, metadata, and file_type failures to increment errors: {errors}"
+        );
+
+        let root_key = fs::canonicalize(root)?;
+        if let Some(entry) = stats.remove(&root_key) {
+            stats.insert(root.to_path_buf(), entry);
+        }
+        let root_stats = stats
+            .get(&root_key)
+            .or_else(|| stats.get(root))
+            .expect("root stats should exist after deeper alternating failures");
+        let root_has_rust = root_stats.language_stats.contains_key("Rust");
+        assert!(
+            root_has_rust,
+            "root stats should retain Rust counts despite deeper alternating failures: {root_stats:?}"
+        );
+
+        let healthy_key = fs::canonicalize(&healthy)?;
+        let healthy_stats = stats
+            .get(&healthy_key)
+            .or_else(|| stats.get(&healthy))
+            .expect("healthy sibling should retain stats");
+        let healthy_has_rust = healthy_stats.language_stats.contains_key("Rust");
+        assert!(
+            healthy_has_rust,
+            "healthy sibling should maintain Rust stats: {healthy_stats:?}"
+        );
+
+        // Ensure failure sentinels are excluded.
+        let level1_read_excluded = stats.contains_key(&fs::canonicalize(&level1_read_sentinel)?);
+        assert!(
+            !level1_read_excluded,
+            "level1 read_dir failure should not appear in stats"
+        );
+        let deep_meta_excluded = stats.contains_key(&fs::canonicalize(&deep_meta_fail)?);
+        assert!(
+            !deep_meta_excluded,
+            "deep metadata failure should not appear in stats"
+        );
+        let nested_read_excluded = stats.contains_key(&fs::canonicalize(&nested_read_fail)?);
+        assert!(
+            !nested_read_excluded,
+            "nested read_dir failure should not appear in stats"
+        );
+
+        // Exercise fallback between canonical and relative keys for the deepest entry failure.
+        let deep_entry_key = fs::canonicalize(&deep_entry_fail)?;
+        let deep_entry_stats = stats
+            .remove(&deep_entry_key)
+            .or_else(|| stats.remove(&deep_entry_fail))
+            .expect("deep entry failure stats should be present for fallback testing");
+        stats.insert(deep_entry_fail.clone(), deep_entry_stats);
+        let deep_entry_lookup = stats
+            .get(&deep_entry_key)
+            .or_else(|| stats.get(&deep_entry_fail))
+            .expect("deep entry fallback should succeed");
+        let deep_entry_has_rust = deep_entry_lookup.language_stats.contains_key("Rust");
+        assert!(
+            deep_entry_has_rust,
+            "deep entry failure branch should retain Rust stats despite surrounding failures: {deep_entry_lookup:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_directory_non_recursive_skips_nested() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        let nested = root.join("nested");
+        fs::create_dir(&nested)?;
+        create_test_file(&nested, "nested.rs", "fn nested() {}\n")?;
+
+        let mut args = test_args();
+        args.non_recursive = true;
+
+        let mut metrics = test_metrics();
+        let mut entries = 0usize;
+        let mut errors = 0usize;
+        let stats = scan_directory_impl(
+            &nested,
+            &args,
+            root,
+            &mut metrics,
+            1,
+            &mut entries,
+            &mut errors,
+            None,
+        )?;
+
+        assert!(
+            stats.is_empty(),
+            "non-recursive scan should skip nested directories: {stats:?}"
+        );
+        assert_eq!(
+            entries, 0,
+            "non-recursive scan should not count entries for nested directories"
+        );
+        assert_eq!(errors, 0, "non-recursive skip should not add errors");
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_directory_deeper_alternating_with_filters() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+
+        create_test_file(root, "root.rs", "fn root() {}\n")?;
+
+        let healthy = root.join("healthy_branch");
+        fs::create_dir(&healthy)?;
+        create_test_file(&healthy, "healthy.rs", "fn healthy() {}\n")?;
+
+        let ignored = root.join("ignored_branch");
+        fs::create_dir(&ignored)?;
+        create_test_file(&ignored, "ignored.rs", "fn ignored() {}\n")?;
+
+        let alternating = root.join("alternating_branch");
+        fs::create_dir(&alternating)?;
+        create_test_file(&alternating, "alt.rs", "fn alt() {}\n")?;
+
+        let alternating_entry = alternating.join(super::ENTRY_ITER_FAIL_TAG);
+        fs::create_dir(&alternating_entry)?;
+        create_test_file(&alternating_entry, "entry.rs", "fn entry_alt() {}\n")?;
+
+        let alternating_read = alternating.join(super::READ_DIR_FAIL_TAG);
+        fs::create_dir(&alternating_read)?;
+
+        let alternating_meta = alternating_entry.join(super::METADATA_FAIL_TAG);
+        fs::create_dir(&alternating_meta)?;
+
+        let mut args = test_args();
+        args.ignore = vec!["ignored_branch".to_string()];
+        args.max_depth = 3;
+
+        let mut metrics = test_metrics();
+        let mut entries = 0usize;
+        let mut errors = 0usize;
+        let mut stats = scan_directory(
+            root,
+            &args,
+            root,
+            &mut metrics,
+            0,
+            &mut entries,
+            &mut errors,
+        )?;
+
+        assert!(
+            errors >= 2,
+            "expected read_dir and metadata failures to increment errors: {errors}"
+        );
+
+        let ignored_key = fs::canonicalize(&ignored)?;
+        assert!(
+            !stats.contains_key(&ignored_key),
+            "ignored branch should not appear in stats"
+        );
+
+        let healthy_key = fs::canonicalize(&healthy)?;
+        let healthy_stats = stats
+            .get(&healthy_key)
+            .or_else(|| stats.get(&healthy))
+            .expect("healthy branch should retain stats");
+        assert!(
+            healthy_stats.language_stats.contains_key("Rust"),
+            "healthy branch should maintain Rust stats: {healthy_stats:?}"
+        );
+
+        let alternating_key = fs::canonicalize(&alternating)?;
+        if let Some(entry) = stats.remove(&alternating_key) {
+            stats.insert(alternating.clone(), entry);
+        }
+        let alternating_stats = stats
+            .get(&alternating_key)
+            .or_else(|| stats.get(&alternating))
+            .expect("alternating branch should retain stats despite failures");
+        assert!(
+            alternating_stats.language_stats.contains_key("Rust"),
+            "alternating branch should keep Rust stats: {alternating_stats:?}"
+        );
+
+        let entry_key = fs::canonicalize(&alternating_entry)?;
+        if let Some(entry) = stats.remove(&entry_key) {
+            stats.insert(alternating_entry.clone(), entry);
+        }
+        let entry_stats = stats
+            .get(&entry_key)
+            .or_else(|| stats.get(&alternating_entry))
+            .expect("entry failure branch should retain stats after fallback");
+        assert!(
+            entry_stats.language_stats.contains_key("Rust"),
+            "entry failure branch should keep Rust stats despite filters: {entry_stats:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_directory_nested_metadata_error_keeps_siblings() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        let good_dir = root.join("good");
+        fs::create_dir(&good_dir)?;
+        create_test_file(&good_dir, "main.rs", "fn main() {}\n")?;
+
+        let sentinel = good_dir.join(super::METADATA_FAIL_TAG);
+        fs::create_dir(&sentinel)?;
+
+        let mut metrics = test_metrics();
+        let mut entries = 0usize;
+        let mut errors = 0usize;
+        let stats = scan_directory(
+            root,
+            &test_args(),
+            root,
+            &mut metrics,
+            0,
+            &mut entries,
+            &mut errors,
+        )?;
+
+        assert!(errors >= 1, "metadata failure should produce an error");
+
+        let good_key = fs::canonicalize(&good_dir)?;
+        let good_stats = stats
+            .get(&good_key)
+            .or_else(|| stats.get(&good_dir))
+            .expect("good directory stats should still be recorded");
+        assert!(
+            good_stats.language_stats.contains_key("Rust"),
+            "expected Rust stats for good directory after metadata failure"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_directory_nested_read_dir_error_keeps_parent() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        let good_dir = root.join("good");
+        fs::create_dir(&good_dir)?;
+        create_test_file(&good_dir, "main.rs", "fn main() {}\n")?;
+
+        let sentinel = good_dir.join(super::READ_DIR_FAIL_TAG);
+        fs::create_dir(&sentinel)?;
+
+        let mut metrics = test_metrics();
+        let mut entries = 0usize;
+        let mut errors = 0usize;
+        let stats = scan_directory(
+            root,
+            &test_args(),
+            root,
+            &mut metrics,
+            0,
+            &mut entries,
+            &mut errors,
+        )?;
+
+        assert!(errors >= 1, "read_dir failure should produce an error");
+        assert!(
+            !stats.contains_key(&fs::canonicalize(&sentinel)?),
+            "sentinel directory should not appear in stats after read_dir failure"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_directory_multiple_failure_siblings() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        let good_dir = root.join("good");
+        fs::create_dir(&good_dir)?;
+        create_test_file(&good_dir, "ok.rs", "fn ok() {}\n")?;
+
+        let metadata_fail = root.join(super::METADATA_FAIL_TAG);
+        fs::create_dir(&metadata_fail)?;
+
+        let read_dir_fail = root.join(super::READ_DIR_FAIL_TAG);
+        fs::create_dir(&read_dir_fail)?;
+
+        let entry_fail = root.join(super::ENTRY_ITER_FAIL_TAG);
+        fs::create_dir(&entry_fail)?;
+        create_test_file(&entry_fail, "entry.rs", "fn entry() {}\n")?;
+
+        let mut metrics = test_metrics();
+        let mut entries = 0usize;
+        let mut errors = 0usize;
+        let stats = scan_directory(
+            root,
+            &test_args(),
+            root,
+            &mut metrics,
+            0,
+            &mut entries,
+            &mut errors,
+        )?;
+
+        assert!(
+            errors >= 3,
+            "expected metadata, read_dir, and entry iteration failures to increment errors: {errors}"
+        );
+
+        let good_key = fs::canonicalize(&good_dir)?;
+        assert!(
+            stats.contains_key(&good_key),
+            "good directory stats should remain even with sibling failures"
+        );
+
+        assert!(
+            !stats.contains_key(&fs::canonicalize(&metadata_fail)?),
+            "metadata failure directory should be absent from stats"
+        );
+        assert!(
+            !stats.contains_key(&fs::canonicalize(&read_dir_fail)?),
+            "read_dir failure directory should be absent from stats"
+        );
+
+        let entry_key = fs::canonicalize(&entry_fail)?;
+        let entry_stats = stats
+            .get(&entry_key)
+            .or_else(|| stats.get(&entry_fail))
+            .expect("entry iteration directory should retain stats");
+        assert!(
+            entry_stats.language_stats.contains_key("Rust"),
+            "entry iteration directory should keep Rust stats despite simulated failure: {entry_stats:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_directory_records_recursive_error() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+
+        let overflow = root.join("overflow");
+        fs::create_dir(&overflow)?;
+        create_test_file(&overflow, "first.rs", "fn first() {}\n")?;
+        create_test_file(&overflow, "second.rs", "fn second() {}\n")?;
+
+        let mut args = test_args();
+        args.max_entries = 1;
+
+        let mut metrics = test_metrics();
+        let mut entries = 0usize;
+        let mut errors = 0usize;
+        let stats = scan_directory(
+            root,
+            &args,
+            root,
+            &mut metrics,
+            0,
+            &mut entries,
+            &mut errors,
+        )?;
+
+        assert_eq!(
+            errors, 1,
+            "expected a single error when subdirectory scan overflows max_entries: {errors}"
+        );
+        assert_eq!(
+            entries, 2,
+            "expected entries counter to reflect the second file triggering overflow: {entries}"
+        );
+        assert!(
+            !stats.contains_key(&fs::canonicalize(&overflow)?),
+            "overflow directory should not contribute stats after recursive scan error: {stats:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_directory_handles_file_root() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let file_path = temp_dir.path().join("single.rs");
+        create_test_file(temp_dir.path(), "single.rs", "fn main() {}\n// comment\n")?;
+
+        let mut metrics = test_metrics();
+        let mut entries = 0usize;
+        let mut errors = 0usize;
+        let stats = scan_directory(
+            &file_path,
+            &test_args(),
+            temp_dir.path(),
+            &mut metrics,
+            0,
+            &mut entries,
+            &mut errors,
+        )?;
+
+        assert_eq!(errors, 0, "file root scan should not record errors");
+        assert_eq!(entries, 1, "expected the single file to be processed");
+
+        let parent_dir = file_path.parent().expect("file should have parent");
+        let guard = CurrentDirGuard::change_to(parent_dir)?;
+        let parent_canonical = fs::canonicalize(Path::new("."))?;
+        let dir_stats = stats
+            .get(Path::new("."))
+            .or_else(|| stats.get(&parent_canonical))
+            .expect("directory stats should capture file root processing");
+        drop(guard);
+        let (lang, (file_total, lang_stats)) = dir_stats
+            .language_stats
+            .iter()
+            .next()
+            .expect("language stats should contain Rust entry");
+        assert_eq!(lang.as_str(), "Rust");
+        assert_eq!(*file_total, 1, "expected exactly one Rust file recorded");
+        assert_eq!(
+            lang_stats.code_lines, 1,
+            "expected code line from main function; stats: {lang_stats:?}"
+        );
+        assert_eq!(
+            lang_stats.comment_lines, 1,
+            "expected single comment line captured; stats: {lang_stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_directory_extended_failure_tree() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+
+        create_test_file(root, "main.rs", "fn main() {}\n")?;
+
+        let branch_a = root.join("branch_a");
+        fs::create_dir(&branch_a)?;
+        create_test_file(&branch_a, "a.rs", "fn a() {}\n")?;
+
+        let entry_fail_level1 = branch_a.join(super::ENTRY_ITER_FAIL_TAG);
+        fs::create_dir(&entry_fail_level1)?;
+        create_test_file(&entry_fail_level1, "level1_ok.rs", "fn l1() {}\n")?;
+
+        let entry_fail_level2 = entry_fail_level1.join(super::ENTRY_ITER_FAIL_TAG);
+        fs::create_dir(&entry_fail_level2)?;
+        create_test_file(&entry_fail_level2, "level2_ok.rs", "fn l2() {}\n")?;
+        create_test_file(
+            &entry_fail_level2,
+            super::FILE_TYPE_FAIL_TAG,
+            "fn impossible() {}\n",
+        )?;
+
+        let nested_meta_fail = entry_fail_level2.join(super::METADATA_FAIL_TAG);
+        fs::create_dir(&nested_meta_fail)?;
+
+        let read_fail_branch = root.join("read_fail_branch");
+        fs::create_dir(&read_fail_branch)?;
+        let read_fail = read_fail_branch.join(super::READ_DIR_FAIL_TAG);
+        fs::create_dir(&read_fail)?;
+
+        let top_metadata_fail = root.join(super::METADATA_FAIL_TAG);
+        fs::create_dir(&top_metadata_fail)?;
+
+        let branch_b = root.join("branch_b");
+        fs::create_dir(&branch_b)?;
+        create_test_file(&branch_b, "b.rs", "fn b() {}\n")?;
+
+        let mut metrics = test_metrics();
+        let mut entries = 0usize;
+        let mut errors = 0usize;
+        let mut stats = scan_directory(
+            root,
+            &test_args(),
+            root,
+            &mut metrics,
+            0,
+            &mut entries,
+            &mut errors,
+        )?;
+
+        assert!(
+            errors >= 6,
+            "expected cumulative metadata/read_dir/file_type/entry errors to increment counter: {errors}"
+        );
+
+        let root_key = fs::canonicalize(root)?;
+        if let Some(entry) = stats.remove(&root_key) {
+            stats.insert(root.to_path_buf(), entry);
+        }
+        let root_stats = stats
+            .get(&root_key)
+            .or_else(|| stats.get(root))
+            .expect("root stats should exist after extended failure tree");
+        assert!(
+            root_stats.language_stats.contains_key("Rust"),
+            "root stats should retain Rust counts after extended failure tree: {root_stats:?}"
+        );
+
+        let branch_a_key = fs::canonicalize(&branch_a)?;
+        if let Some(entry) = stats.remove(&branch_a_key) {
+            stats.insert(branch_a.clone(), entry);
+        }
+        let branch_a_stats = stats
+            .get(&branch_a_key)
+            .or_else(|| stats.get(&branch_a))
+            .expect("branch_a stats should exist despite nested failures");
+        assert!(
+            branch_a_stats.language_stats.contains_key("Rust"),
+            "branch_a should retain Rust stats: {branch_a_stats:?}"
+        );
+
+        let entry_level1_key = fs::canonicalize(&entry_fail_level1)?;
+        if let Some(entry) = stats.remove(&entry_level1_key) {
+            stats.insert(entry_fail_level1.clone(), entry);
+        }
+        let entry_level1_stats = stats
+            .get(&entry_level1_key)
+            .or_else(|| stats.get(&entry_fail_level1))
+            .expect("entry_fail_level1 stats should be preserved");
+        assert!(
+            entry_level1_stats.language_stats.contains_key("Rust"),
+            "entry_fail_level1 should retain Rust stats despite injected failures: {entry_level1_stats:?}"
+        );
+
+        let branch_b_key = fs::canonicalize(&branch_b)?;
+        assert!(
+            stats
+                .get(&branch_b_key)
+                .or_else(|| stats.get(&branch_b))
+                .is_some(),
+            "branch_b should contribute stats alongside failure branches"
+        );
+
+        assert!(
+            !stats.contains_key(&fs::canonicalize(&top_metadata_fail)?),
+            "top-level metadata failure should be excluded from stats"
+        );
+        assert!(
+            !stats.contains_key(&fs::canonicalize(&read_fail)?),
+            "read_dir failure directory should be excluded from stats"
+        );
+        assert!(
+            !stats.contains_key(&fs::canonicalize(&nested_meta_fail)?),
+            "nested metadata failure should be excluded from stats"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_directory_multiple_entry_failure_branches() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+
+        create_test_file(root, "root.rs", "fn root() {}\n")?;
+
+        for branch_name in ["branch_a", "branch_b"] {
+            let branch = root.join(branch_name);
+            fs::create_dir(&branch)?;
+            create_test_file(&branch, "ok.rs", "fn ok() {}\n")?;
+
+            let entry_fail = branch.join(super::ENTRY_ITER_FAIL_TAG);
+            fs::create_dir(&entry_fail)?;
+            create_test_file(&entry_fail, "inner.rs", "fn inner() {}\n")?;
+            create_test_file(
+                &entry_fail,
+                super::FILE_TYPE_FAIL_TAG,
+                "fn should_error() {}\n",
+            )?;
+
+            let nested_meta = entry_fail.join(super::METADATA_FAIL_TAG);
+            fs::create_dir(&nested_meta)?;
+
+            let nested_read_dir = entry_fail.join(super::READ_DIR_FAIL_TAG);
+            fs::create_dir(&nested_read_dir)?;
+        }
+
+        let mut metrics = test_metrics();
+        let mut entries = 0usize;
+        let mut errors = 0usize;
+        let mut stats = scan_directory(
+            root,
+            &test_args(),
+            root,
+            &mut metrics,
+            0,
+            &mut entries,
+            &mut errors,
+        )?;
+
+        assert!(
+            errors >= 8,
+            "expected cumulative failures across sibling entry branches: {errors}"
+        );
+
+        let root_key = fs::canonicalize(root)?;
+        if let Some(entry) = stats.remove(&root_key) {
+            stats.insert(root.to_path_buf(), entry);
+        }
+        let root_stats = stats
+            .get(&root_key)
+            .or_else(|| stats.get(root))
+            .expect("root stats should survive multi-branch failures");
+        assert!(
+            root_stats.language_stats.contains_key("Rust"),
+            "root stats should retain Rust counts after failures: {root_stats:?}"
+        );
+
+        for branch_name in ["branch_a", "branch_b"] {
+            let branch = root.join(branch_name);
+            let entry_dir = branch.join(super::ENTRY_ITER_FAIL_TAG);
+            let entry_canonical = fs::canonicalize(&entry_dir).ok();
+            if let Some(canon) = entry_canonical.as_ref() {
+                if let Some(entry) = stats.remove(canon) {
+                    stats.insert(entry_dir.clone(), entry);
+                }
+
+                // Regenerate canonical stats so both key forms coexist before exercising fallback.
+                let mut regen_metrics = test_metrics();
+                let mut regen_entries = 0usize;
+                let mut regen_errors = 0usize;
+                let mut regen_stats = scan_directory(
+                    root,
+                    &test_args(),
+                    root,
+                    &mut regen_metrics,
+                    0,
+                    &mut regen_entries,
+                    &mut regen_errors,
+                )?;
+                let dup_entry = regen_stats
+                    .remove(canon)
+                    .or_else(|| regen_stats.remove(&entry_dir))
+                    .expect("regenerated stats should contain canonical entry");
+                stats.insert(canon.clone(), dup_entry);
+
+                if let Some(entry) = stats.remove(canon) {
+                    stats.insert(entry_dir.clone(), entry);
+                }
+            }
+            let entry_stats = entry_canonical
+                .and_then(|p| stats.get(&p))
+                .or_else(|| stats.get(&entry_dir))
+                .expect("entry iteration directory should keep stats despite sibling failures");
+            assert!(
+                entry_stats.language_stats.contains_key("Rust"),
+                "entry iteration stats should retain Rust counts: {entry_stats:?}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_directory_relative_root_fallback_stats() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let guard = CurrentDirGuard::change_to(temp_dir.path())?;
+        create_test_file(Path::new("."), "main.rs", "fn main() {}\n")?;
+
+        let mut metrics = test_metrics();
+        let mut entries = 0usize;
+        let mut errors = 0usize;
+        let mut stats = scan_directory(
+            Path::new("."),
+            &test_args(),
+            temp_dir.path(),
+            &mut metrics,
+            0,
+            &mut entries,
+            &mut errors,
+        )?;
+
+        assert_eq!(errors, 0, "relative scan should not record errors");
+        assert_eq!(entries, 1, "expected single file processed");
+
+        let canonical = fs::canonicalize(".")?;
+        let entry = stats
+            .remove(&canonical)
+            .or_else(|| stats.remove(Path::new(".")))
+            .expect("expected canonical or relative '.' key to exist initially");
+        stats.insert(PathBuf::from("."), entry);
+
+        let dot_stats = stats
+            .get(&canonical)
+            .or_else(|| stats.get(Path::new(".")))
+            .expect("fallback should locate relative '.' entry");
+        assert!(
+            dot_stats.language_stats.contains_key("Rust"),
+            "expected Rust stats in relative '.' entry: {dot_stats:?}"
+        );
+
+        drop(guard);
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_directory_nested_entry_and_file_type_failures() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        let healthy = root.join("healthy");
+        fs::create_dir(&healthy)?;
+        create_test_file(&healthy, "ok.rs", "fn ok() {}\n")?;
+
+        let entry_fail = healthy.join(super::ENTRY_ITER_FAIL_TAG);
+        fs::create_dir(&entry_fail)?;
+        create_test_file(&entry_fail, "good.rs", "fn good() {}\n")?;
+        create_test_file(&entry_fail, super::FILE_TYPE_FAIL_TAG, "fn bad() {}\n")?;
+
+        let read_dir_fail = entry_fail.join(super::READ_DIR_FAIL_TAG);
+        fs::create_dir(&read_dir_fail)?;
+        create_test_file(&read_dir_fail, "nested.rs", "fn nested() {}\n")?;
+
+        let metadata_fail = entry_fail.join(super::METADATA_FAIL_TAG);
+        fs::create_dir(&metadata_fail)?;
+        create_test_file(&metadata_fail, "ignored.rs", "fn ignored() {}\n")?;
+
+        let mut metrics = test_metrics();
+        let mut entries = 0usize;
+        let mut errors = 0usize;
+        let stats = scan_directory(
+            root,
+            &test_args(),
+            root,
+            &mut metrics,
+            0,
+            &mut entries,
+            &mut errors,
+        )?;
+
+        assert!(
+            errors >= 4,
+            "expected entry iteration, file type, read_dir, and metadata failures to increment errors: {errors}"
+        );
+
+        let healthy_key = fs::canonicalize(&healthy)?;
+        let healthy_stats = stats
+            .get(&healthy_key)
+            .or_else(|| stats.get(&healthy))
+            .expect("healthy directory stats should be recorded");
+        assert!(
+            healthy_stats.language_stats.contains_key("Rust"),
+            "healthy directory should retain Rust stats after failures: {healthy_stats:?}"
+        );
+
+        let entry_key = fs::canonicalize(&entry_fail)?;
+        let entry_stats = stats
+            .get(&entry_key)
+            .or_else(|| stats.get(&entry_fail))
+            .expect("entry failure directory stats should exist after simulated error");
+        assert!(
+            entry_stats.language_stats.contains_key("Rust"),
+            "entry failure directory should retain Rust stats after error injection: {entry_stats:?}"
+        );
+
+        assert!(
+            !stats.contains_key(&fs::canonicalize(&read_dir_fail)?),
+            "read_dir failure directory should be skipped in stats"
+        );
+        assert!(
+            !stats.contains_key(&fs::canonicalize(&metadata_fail)?),
+            "metadata failure directory should be skipped in stats"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_directory_respects_non_recursive_flag() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        let subdir = root.join("sub");
+        fs::create_dir(&subdir)?;
+        create_test_file(root, "root.rs", "fn root() {}\n")?;
+        create_test_file(&subdir, "child.rs", "fn child() {}\n")?;
+
+        let mut args = test_args();
+        args.non_recursive = true;
+
+        let mut metrics = test_metrics();
+        let mut entries = 0usize;
+        let mut errors = 0usize;
+        let stats = scan_directory(
+            root,
+            &args,
+            root,
+            &mut metrics,
+            0,
+            &mut entries,
+            &mut errors,
+        )?;
+
+        assert!(
+            stats.contains_key(&fs::canonicalize(root)?),
+            "root stats should exist when non_recursive is true"
+        );
+        assert!(
+            !stats.contains_key(&fs::canonicalize(&subdir)?),
+            "subdirectories should be skipped when non_recursive is true"
+        );
+        assert_eq!(errors, 0, "non-recursive scan should not produce errors");
+        Ok(())
+    }
+
+    #[test]
     fn test_scan_directory_missing_path_records_error() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         let missing = temp_dir.path().join("does_not_exist");
@@ -2680,6 +4899,247 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_directory_max_depth_with_failures() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        let level1 = root.join("level1");
+        let level2 = level1.join("level2");
+        fs::create_dir(&level1)?;
+        fs::create_dir(&level2)?;
+        create_test_file(root, "root.rs", "fn root() {}\n")?;
+        create_test_file(&level1, "child.rs", "fn child() {}\n")?;
+        create_test_file(&level2, "grandchild.rs", "fn grandchild() {}\n")?;
+
+        let sentinel = level2.join(super::METADATA_FAIL_TAG);
+        fs::create_dir(&sentinel)?;
+
+        let mut args = test_args();
+        args.max_depth = 1;
+
+        let mut metrics = test_metrics();
+        let mut entries = 0usize;
+        let mut errors = 0usize;
+        let stats = scan_directory(
+            root,
+            &args,
+            root,
+            &mut metrics,
+            0,
+            &mut entries,
+            &mut errors,
+        )?;
+
+        let root_key = fs::canonicalize(root)?;
+        let level1_key = fs::canonicalize(&level1)?;
+        let level2_key = fs::canonicalize(&level2)?;
+
+        assert!(
+            stats.contains_key(&root_key),
+            "root stats should exist when max_depth restricts traversal"
+        );
+        assert!(
+            stats.contains_key(&level1_key),
+            "level1 should be included when max_depth allows depth 1"
+        );
+        assert!(
+            !stats.contains_key(&level2_key),
+            "level2 should be skipped when max_depth is 1"
+        );
+        assert!(
+            errors >= 1,
+            "skipping deeper levels should increment error_count via warning path, got {errors}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_directory_deep_alternating_failures() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+
+        // success branch
+        let keep_dir = root.join("keep");
+        fs::create_dir(&keep_dir)?;
+        create_test_file(&keep_dir, "keep.rs", "fn keep() {}\n")?;
+
+        // failure branch with alternating success
+        let fail_root = root.join("fail_root");
+        fs::create_dir(&fail_root)?;
+        let entry_fail = fail_root.join(super::ENTRY_ITER_FAIL_TAG);
+        fs::create_dir(&entry_fail)?;
+        create_test_file(&entry_fail, "entry.rs", "fn entry() {}\n")?;
+
+        let success_under_fail = entry_fail.join("success");
+        fs::create_dir(&success_under_fail)?;
+        create_test_file(&success_under_fail, "ok.rs", "fn ok() {}\n")?;
+
+        let metadata_fail = success_under_fail.join(super::METADATA_FAIL_TAG);
+        fs::create_dir(&metadata_fail)?;
+
+        let mut metrics = test_metrics();
+        let mut entries = 0usize;
+        let mut errors = 0usize;
+        let stats = scan_directory(
+            root,
+            &test_args(),
+            root,
+            &mut metrics,
+            0,
+            &mut entries,
+            &mut errors,
+        )?;
+
+        assert!(
+            errors >= 2,
+            "expected alternating failure tree to increment errors multiple times: {errors}"
+        );
+
+        let keep_key = fs::canonicalize(&keep_dir)?;
+        assert!(
+            stats.contains_key(&keep_key),
+            "keep directory should remain in stats despite sibling failures"
+        );
+
+        let entry_key = fs::canonicalize(&entry_fail)?;
+        let entry_stats = stats
+            .get(&entry_key)
+            .or_else(|| stats.get(&entry_fail))
+            .expect("entry failure directory should retain stats in alternating layout");
+        assert!(
+            entry_stats.language_stats.contains_key("Rust"),
+            "entry failure directory should keep Rust stats after alternating failures: {entry_stats:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_directory_failure_counter_accumulates() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        create_test_file(root, "root.rs", "fn root() {}\n")?;
+
+        let meta_fail = root.join(super::METADATA_FAIL_TAG);
+        fs::create_dir(&meta_fail)?;
+
+        let read_fail = root.join(super::READ_DIR_FAIL_TAG);
+        fs::create_dir(&read_fail)?;
+
+        let entry_dir = root.join(super::ENTRY_ITER_FAIL_TAG);
+        fs::create_dir(&entry_dir)?;
+        create_test_file(&entry_dir, "keep.rs", "fn keep() {}\n")?;
+
+        let nested_file_type = entry_dir.join("nested");
+        fs::create_dir(&nested_file_type)?;
+        create_test_file(
+            &nested_file_type,
+            super::FILE_TYPE_FAIL_TAG,
+            "fn fail() {}\n",
+        )?;
+
+        let mut metrics = test_metrics();
+        let mut entries = 0usize;
+        let mut errors = 0usize;
+        let stats = scan_directory(
+            root,
+            &test_args(),
+            root,
+            &mut metrics,
+            0,
+            &mut entries,
+            &mut errors,
+        )?;
+
+        assert!(
+            errors >= 4,
+            "expected multiple failure types to accumulate error count, got {errors}"
+        );
+
+        let entry_key = fs::canonicalize(&entry_dir)?;
+        assert!(
+            stats.contains_key(&entry_key),
+            "entry iteration directory should remain in stats despite additional failures"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_directory_failure_counter_exceeds_four() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        create_test_file(root, "root.rs", "fn root() {}\n")?;
+
+        let meta_fail = root.join(super::METADATA_FAIL_TAG);
+        fs::create_dir(&meta_fail)?;
+
+        let read_fail = root.join(super::READ_DIR_FAIL_TAG);
+        fs::create_dir(&read_fail)?;
+
+        let entry_fail_level1 = root.join(super::ENTRY_ITER_FAIL_TAG);
+        fs::create_dir(&entry_fail_level1)?;
+        create_test_file(&entry_fail_level1, "keep.rs", "fn keep() {}\n")?;
+
+        let nested_meta = entry_fail_level1.join(super::METADATA_FAIL_TAG);
+        fs::create_dir(&nested_meta)?;
+
+        let nested_read = entry_fail_level1.join(super::READ_DIR_FAIL_TAG);
+        fs::create_dir(&nested_read)?;
+
+        let entry_fail_level2 = entry_fail_level1.join(super::ENTRY_ITER_FAIL_TAG);
+        fs::create_dir(&entry_fail_level2)?;
+        create_test_file(&entry_fail_level2, "inner.rs", "fn inner() {}\n")?;
+
+        create_test_file(
+            &entry_fail_level2,
+            super::FILE_TYPE_FAIL_TAG,
+            "fn violation() {}\n",
+        )?;
+
+        let deep_meta = entry_fail_level2.join(super::METADATA_FAIL_TAG);
+        fs::create_dir(&deep_meta)?;
+
+        let mut metrics = test_metrics();
+        let mut entries = 0usize;
+        let mut errors = 0usize;
+        let stats = scan_directory(
+            root,
+            &test_args(),
+            root,
+            &mut metrics,
+            0,
+            &mut entries,
+            &mut errors,
+        )?;
+
+        assert!(
+            errors >= 7,
+            "expected failures to push error count beyond four, got {errors}"
+        );
+
+        let root_key = fs::canonicalize(root)?;
+        let root_stats = stats
+            .get(&root_key)
+            .or_else(|| stats.get(root))
+            .expect("root stats should exist after failure aggregation");
+        assert!(
+            root_stats.language_stats.contains_key("Rust"),
+            "root stats should retain Rust code despite failures: {root_stats:?}"
+        );
+
+        let entry_key = fs::canonicalize(&entry_fail_level1)?;
+        let entry_stats = stats
+            .get(&entry_key)
+            .or_else(|| stats.get(&entry_fail_level1))
+            .expect("entry failure directory should retain stats");
+        assert!(
+            entry_stats.language_stats.contains_key("Rust"),
+            "entry failure directory should retain Rust stats after multiple failures: {entry_stats:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_scan_directory_auto_ignores_special_dirs() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         let root = temp_dir.path();
@@ -2723,6 +5183,49 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_directory_ignore_list_retains_siblings() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        let ignore_dir = root.join("ignore_me");
+        let keep_dir = root.join("keep_me");
+        fs::create_dir(&ignore_dir)?;
+        fs::create_dir(&keep_dir)?;
+        create_test_file(&ignore_dir, "ignored.rs", "fn ignored() {}\n")?;
+        create_test_file(&keep_dir, "keep.rs", "fn keep() {}\n")?;
+
+        let mut args = test_args();
+        args.ignore = vec!["ignore_me".to_string()];
+
+        let mut metrics = test_metrics();
+        let mut entries_count = 0usize;
+        let mut error_count = 0usize;
+        let stats = scan_directory(
+            root,
+            &args,
+            root,
+            &mut metrics,
+            0,
+            &mut entries_count,
+            &mut error_count,
+        )?;
+
+        let keep_key = fs::canonicalize(&keep_dir)?;
+        assert!(
+            stats.contains_key(&keep_key),
+            "keep_me directory should remain in stats when ignore list excludes it"
+        );
+        assert!(
+            !stats.contains_key(&fs::canonicalize(&ignore_dir)?),
+            "ignore_me directory should be omitted from stats"
+        );
+        assert_eq!(
+            error_count, 0,
+            "ignoring directories should not raise errors"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_rust_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(temp_dir.path(), "test.rs", "fn main() {\n// Line comment\n/* Block comment */\n/// Doc comment\n//! Module comment\nprintln!(\"Hello\");\n}\n")?;
@@ -2730,6 +5233,22 @@ mod tests {
         assert_eq!(stats.code_lines, 3);
         assert_eq!(stats.comment_lines, 4);
         assert_eq!(stats.blank_lines, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_rust_counts_blank_lines() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "blank.rs",
+            "fn main() {\n\n    println!(\"hi\");\n}\n",
+        )?;
+        let (stats, _total_lines) = count_rust_lines(temp_dir.path().join("blank.rs").as_path())?;
+        assert!(
+            stats.blank_lines >= 1,
+            "expected blank lines to be counted: {stats:?}"
+        );
         Ok(())
     }
 
@@ -2744,6 +5263,27 @@ mod tests {
         let (stats, _total_lines) = count_rust_lines(temp_dir.path().join("trail.rs").as_path())?;
         assert_eq!(stats.code_lines, 4);
         assert_eq!(stats.comment_lines, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_rust_block_comment_followed_by_line_comment_same_line() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "close_line.rs",
+            "fn annotate() {\nlet value = 1; /* block */ // trailing comment\n}\n",
+        )?;
+        let (stats, _total_lines) =
+            count_rust_lines(temp_dir.path().join("close_line.rs").as_path())?;
+        assert_eq!(
+            stats.code_lines, 3,
+            "code lines should not double-count after block close: {stats:?}"
+        );
+        assert_eq!(
+            stats.comment_lines, 1,
+            "trailing line comment on same line is suppressed after block close: {stats:?}"
+        );
         Ok(())
     }
 
@@ -2772,6 +5312,27 @@ mod tests {
         let (stats, _total_lines) = count_rust_lines(temp_dir.path().join("multi.rs").as_path())?;
         assert!(stats.code_lines >= 3, "stats: {:?}", stats);
         assert!(stats.comment_lines >= 2, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_rust_multiline_block_closes_with_trailing_code_same_line() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "inline_close.rs",
+            "fn value() {\n/* start\n  middle */ let x = 1;\n}\n",
+        )?;
+        let (stats, _total_lines) =
+            count_rust_lines(temp_dir.path().join("inline_close.rs").as_path())?;
+        assert!(
+            stats.code_lines >= 2,
+            "expected trailing code after block close counted as code: {stats:?}"
+        );
+        assert!(
+            stats.comment_lines >= 2,
+            "expected multiline block comment counted appropriately: {stats:?}"
+        );
         Ok(())
     }
 
@@ -2859,6 +5420,27 @@ fn decorated() {
     }
 
     #[test]
+    fn test_python_multiline_comment_closes_with_code() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "doc_with_code.py",
+            "\"\"\"doc start\nbody\nend\"\"\" value = 42\n",
+        )?;
+        let (stats, _total_lines) =
+            count_python_lines(temp_dir.path().join("doc_with_code.py").as_path())?;
+        assert!(
+            stats.comment_lines >= 2,
+            "expected multiline docstring counted as comments: {stats:?}"
+        );
+        assert_eq!(
+            stats.code_lines, 1,
+            "code following docstring close should be counted once: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_python_triple_quotes_and_continuation() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
@@ -2892,6 +5474,257 @@ fn decorated() {
     }
 
     #[test]
+    fn test_python_docstring_trailing_comment_suppresses_code() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "doc_comment.py",
+            "\"\"\"doc\"\"\" # trailing comment only\n",
+        )?;
+        let (stats, _total_lines) =
+            count_python_lines(temp_dir.path().join("doc_comment.py").as_path())?;
+        assert_eq!(
+            stats.code_lines, 0,
+            "code should not be counted when trailing segment is comment: {stats:?}"
+        );
+        assert_eq!(stats.comment_lines, 1, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_python_docstring_closes_with_code_and_comment() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "doc_with_code_comment.py",
+            "\"\"\"doc\\nbody\\nend\"\"\" value = 42 # note\n",
+        )?;
+        let (stats, _total_lines) =
+            count_python_lines(temp_dir.path().join("doc_with_code_comment.py").as_path())?;
+        assert!(
+            stats.comment_lines >= 1,
+            "expected docstring lines counted as comments: {stats:?}"
+        );
+        assert!(
+            stats.code_lines >= 1,
+            "expected trailing code to be counted: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_python_docstring_with_blank_line_after_close() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "doc_with_blank.py",
+            "\"\"\"doc\"\"\"\n\nprint('done')\n",
+        )?;
+        let (stats, _total_lines) =
+            count_python_lines(temp_dir.path().join("doc_with_blank.py").as_path())?;
+        assert!(
+            stats.comment_lines >= 1,
+            "expected docstring to count as comment: {stats:?}"
+        );
+        assert!(
+            stats.blank_lines >= 1,
+            "expected blank line after docstring: {stats:?}"
+        );
+        assert!(
+            stats.code_lines >= 1,
+            "expected code following blank line: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_python_docstring_with_only_whitespace_after_close() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "doc_with_whitespace.py",
+            "\"\"\"doc\"\"\"\n    \n",
+        )?;
+        let (stats, _total_lines) =
+            count_python_lines(temp_dir.path().join("doc_with_whitespace.py").as_path())?;
+        assert_eq!(
+            stats.comment_lines, 1,
+            "docstring should count as comment: {stats:?}"
+        );
+        assert_eq!(
+            stats.blank_lines, 1,
+            "whitespace line should count as blank: {stats:?}"
+        );
+        assert_eq!(
+            stats.code_lines, 0,
+            "no code should be counted after whitespace: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_python_docstring_whitespace_then_code() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "doc_with_whitespace_code.py",
+            "\"\"\"doc\"\"\"\n    \nprint('done')\n",
+        )?;
+        let (stats, _total_lines) = count_python_lines(
+            temp_dir
+                .path()
+                .join("doc_with_whitespace_code.py")
+                .as_path(),
+        )?;
+        assert_eq!(
+            stats.comment_lines, 1,
+            "docstring line should count as comment: {stats:?}"
+        );
+        assert_eq!(
+            stats.blank_lines, 1,
+            "whitespace-only separator should count as blank: {stats:?}"
+        );
+        assert!(
+            stats.code_lines >= 1,
+            "code following whitespace should be counted: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_python_docstring_whitespace_then_comment() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "doc_with_whitespace_comment.py",
+            "\"\"\"doc\"\"\"\n    \n# trailing comment\n",
+        )?;
+        let (stats, _total_lines) = count_python_lines(
+            temp_dir
+                .path()
+                .join("doc_with_whitespace_comment.py")
+                .as_path(),
+        )?;
+        assert!(
+            stats.comment_lines >= 2,
+            "expected docstring and trailing hash as comments: {stats:?}"
+        );
+        assert_eq!(stats.blank_lines, 1);
+        assert_eq!(stats.code_lines, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_yaml_hash_comments() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "sample.yaml",
+            "# leading comment\nkey: value\n\n# trailing\n",
+        )?;
+        let (stats, total) = count_yaml_lines(temp_dir.path().join("sample.yaml").as_path())?;
+        assert_eq!(total, 4);
+        assert_eq!(stats.comment_lines, 2);
+        assert_eq!(stats.code_lines, 1);
+        assert_eq!(stats.blank_lines, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_yaml_inline_hash_after_code() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(temp_dir.path(), "inline.yaml", "key: value # comment\n")?;
+        let (stats, total) = count_yaml_lines(temp_dir.path().join("inline.yaml").as_path())?;
+        assert_eq!(total, 1);
+        assert_eq!(stats.code_lines, 1);
+        assert_eq!(stats.comment_lines, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_toml_hash_comments() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "config.toml",
+            "title = \"test\"\n# note\n\nvalue = 1\n",
+        )?;
+        let (stats, total) = count_toml_lines(temp_dir.path().join("config.toml").as_path())?;
+        assert_eq!(total, 4);
+        assert_eq!(stats.comment_lines, 1);
+        assert_eq!(stats.code_lines, 2);
+        assert_eq!(stats.blank_lines, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_toml_inline_hash_after_code() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(temp_dir.path(), "inline.toml", "value = 1 # note\n")?;
+        let (stats, total) = count_toml_lines(temp_dir.path().join("inline.toml").as_path())?;
+        assert_eq!(total, 1);
+        assert_eq!(stats.code_lines, 1);
+        assert_eq!(stats.comment_lines, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_hcl_block_comment_spanning_lines() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "multi.hcl",
+            "resource \"x\" \"y\" {\n  /* start\n     still comment */ value = 1\n}\n",
+        )?;
+        let (stats, _total_lines) = count_hcl_lines(temp_dir.path().join("multi.hcl").as_path())?;
+        assert!(
+            stats.comment_lines >= 2,
+            "expected block comment lines counted: {stats:?}"
+        );
+        assert!(
+            stats.code_lines >= 2,
+            "expected resource lines counted as code: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_hcl_unterminated_block_comment() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "unterminated.hcl",
+            "variable \"x\" {\n  value = 1 /* start\n     still comment\n",
+        )?;
+        let (stats, _total_lines) =
+            count_hcl_lines(temp_dir.path().join("unterminated.hcl").as_path())?;
+        assert!(
+            stats.comment_lines >= 1,
+            "unterminated block should count comment lines: {stats:?}"
+        );
+        assert!(
+            stats.code_lines >= 1,
+            "initial code should be counted: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_ini_hash_comments() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "config.ini",
+            "[section]\n# note\n; another\nkey=value\n",
+        )?;
+        let (stats, total) = count_ini_lines(temp_dir.path().join("config.ini").as_path())?;
+        assert_eq!(total, 4);
+        assert_eq!(stats.comment_lines, 2, "stats: {:?}", stats);
+        assert_eq!(stats.code_lines, 2, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
     fn test_powershell_nested_block_transitions() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
@@ -2903,6 +5736,316 @@ fn decorated() {
             count_powershell_lines(temp_dir.path().join("complex.ps1").as_path())?;
         assert!(stats.code_lines >= 2);
         assert!(stats.comment_lines >= 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_powershell_block_comment_with_trailing_code() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "inline_comment.ps1",
+            "<# note #> Write-Host 'done'\n",
+        )?;
+        let (stats, _total_lines) =
+            count_powershell_lines(temp_dir.path().join("inline_comment.ps1").as_path())?;
+        assert_eq!(stats.comment_lines, 1, "stats: {:?}", stats);
+        assert_eq!(stats.code_lines, 1, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_powershell_block_comment_spanning_lines() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "multiline_comment.ps1",
+            "<# start\nstill comment\n#>\nWrite-Host 'after'\n",
+        )?;
+        let (stats, _total_lines) =
+            count_powershell_lines(temp_dir.path().join("multiline_comment.ps1").as_path())?;
+        assert!(
+            stats.comment_lines >= 2,
+            "expected multiline comment lines counted: {stats:?}"
+        );
+        assert!(
+            stats.code_lines >= 1,
+            "expected code after block to be counted: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_powershell_block_and_line_interleaved() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "interleaved.ps1",
+            "Write-Host 'mix'<#block#>Write-Host 'after'<#open\ncontinued\n#># trailing\n",
+        )?;
+        let (stats, _total_lines) =
+            count_powershell_lines(temp_dir.path().join("interleaved.ps1").as_path())?;
+        assert!(
+            stats.comment_lines >= 3,
+            "expected multiple comment segments: {stats:?}"
+        );
+        assert!(
+            stats.code_lines >= 2,
+            "expected inline code portions counted: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_analysis_report_includes_totals() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let mut stats_map = HashMap::new();
+        let mut dir_stats = DirectoryStats::default();
+        dir_stats.language_stats.insert(
+            "Rust".to_string(),
+            (
+                1,
+                LanguageStats {
+                    code_lines: 3,
+                    comment_lines: 1,
+                    blank_lines: 0,
+                    overlap_lines: 0,
+                },
+            ),
+        );
+        dir_stats.language_stats.insert(
+            "Python".to_string(),
+            (
+                2,
+                LanguageStats {
+                    code_lines: 4,
+                    comment_lines: 2,
+                    blank_lines: 1,
+                    overlap_lines: 0,
+                },
+            ),
+        );
+        stats_map.insert(temp_dir.path().to_path_buf(), dir_stats);
+
+        let report = build_analysis_report(temp_dir.path(), &stats_map, 3, 11, 1);
+        assert!(
+            report.contains("Totals by language:"),
+            "report should include totals header: {report}"
+        );
+        assert!(
+            report.contains("Rust") && report.contains("Python"),
+            "report should include language rows: {report}"
+        );
+        assert!(
+            report.contains("Overall Summary:"),
+            "report should include overall summary block: {report}"
+        );
+        assert!(
+            report.contains("Warning"),
+            "report should note warnings when error count > 0: {report}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_analysis_report_handles_zero_totals() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let stats_map: HashMap<PathBuf, DirectoryStats> = HashMap::new();
+        let report = build_analysis_report(temp_dir.path(), &stats_map, 0, 0, 0);
+        assert!(
+            report.contains("Detailed source code analysis"),
+            "report should always include table header: {report}"
+        );
+        assert!(
+            report.contains("Totals by language:"),
+            "report should include totals header even when empty: {report}"
+        );
+        assert!(
+            !report.contains("Overall Summary"),
+            "zero files/lines should skip overall summary: {report}"
+        );
+        assert!(
+            !report.contains("Warning"),
+            "zero errors should not emit warning section: {report}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_analysis_report_multiple_directories() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let current = temp_dir.path();
+
+        let mut stats_map = HashMap::new();
+        let src_dir = current.join("src");
+        let docs_dir = current.join("docs");
+        let outside_dir = PathBuf::from("C:\\outside");
+
+        let mut src_stats = DirectoryStats::default();
+        src_stats.language_stats.insert(
+            "Rust".to_string(),
+            (
+                2,
+                LanguageStats {
+                    code_lines: 10,
+                    comment_lines: 2,
+                    blank_lines: 1,
+                    overlap_lines: 0,
+                },
+            ),
+        );
+        src_stats.language_stats.insert(
+            "Python".to_string(),
+            (
+                1,
+                LanguageStats {
+                    code_lines: 5,
+                    comment_lines: 0,
+                    blank_lines: 0,
+                    overlap_lines: 0,
+                },
+            ),
+        );
+
+        let mut docs_stats = DirectoryStats::default();
+        docs_stats
+            .language_stats
+            .insert("Markdown".to_string(), (1, LanguageStats::default()));
+
+        let mut outside_stats = DirectoryStats::default();
+        outside_stats.language_stats.insert(
+            "Shell".to_string(),
+            (
+                1,
+                LanguageStats {
+                    code_lines: 0,
+                    comment_lines: 1,
+                    blank_lines: 0,
+                    overlap_lines: 0,
+                },
+            ),
+        );
+
+        stats_map.insert(src_dir.clone(), src_stats);
+        stats_map.insert(docs_dir.clone(), docs_stats);
+        stats_map.insert(outside_dir.clone(), outside_stats);
+
+        let report = build_analysis_report(current, &stats_map, 4, 13, 0);
+
+        assert!(
+            report.contains("src"),
+            "expected relative directory to appear in report: {report}"
+        );
+        assert!(
+            report.contains("docs"),
+            "expected second relative directory in report: {report}"
+        );
+        assert!(
+            report.contains("C:\\outside"),
+            "absolute path should remain in report: {report}"
+        );
+        assert!(
+            report.contains("Totals by language:"),
+            "report should include totals header: {report}"
+        );
+        assert!(
+            report.contains("Overall Summary"),
+            "non-zero files should include overall summary: {report}"
+        );
+        assert!(
+            !report.contains("Warning"),
+            "zero error count should suppress warning section: {report}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_analysis_report_long_path_truncation() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let base = temp_dir.path();
+        let long_dir =
+            base.join("a_very_long_directory_name_that_exceeds_the_width_limit_for_display");
+
+        fs::create_dir_all(&long_dir)?;
+
+        let mut stats_map = HashMap::new();
+        let mut dir_stats = DirectoryStats::default();
+        dir_stats.language_stats.insert(
+            "Rust".to_string(),
+            (
+                1,
+                LanguageStats {
+                    code_lines: 3,
+                    comment_lines: 0,
+                    blank_lines: 0,
+                    overlap_lines: 0,
+                },
+            ),
+        );
+        stats_map.insert(long_dir.clone(), dir_stats);
+
+        let display = super::format_directory_display(&long_dir, base);
+        assert!(
+            display.starts_with("..."),
+            "long directory display should be truncated with ellipsis: {display}"
+        );
+        assert!(
+            display.chars().count() <= DIR_WIDTH,
+            "truncated display should not exceed DIR_WIDTH: {display}"
+        );
+
+        let report = build_analysis_report(base, &stats_map, 1, 3, 0);
+        assert!(
+            report.contains(&display),
+            "report should contain truncated directory display: {report}"
+        );
+        assert!(
+            report.contains("Rust"),
+            "report should include language totals for truncated directory: {report}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_analysis_report_language_ordering() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let mut stats_map = HashMap::new();
+
+        let mut dir_stats = DirectoryStats::default();
+        dir_stats.language_stats.insert(
+            "Zig".to_string(),
+            (
+                1,
+                LanguageStats {
+                    code_lines: 4,
+                    comment_lines: 0,
+                    blank_lines: 0,
+                    overlap_lines: 0,
+                },
+            ),
+        );
+        dir_stats.language_stats.insert(
+            "Ada".to_string(),
+            (
+                1,
+                LanguageStats {
+                    code_lines: 4,
+                    comment_lines: 0,
+                    blank_lines: 0,
+                    overlap_lines: 0,
+                },
+            ),
+        );
+        stats_map.insert(temp_dir.path().to_path_buf(), dir_stats);
+
+        let report = build_analysis_report(temp_dir.path(), &stats_map, 2, 8, 0);
+        let ada_idx = report.find("Ada");
+        let zig_idx = report.find("Zig");
+        assert!(
+            ada_idx.is_some() && zig_idx.is_some() && ada_idx < zig_idx,
+            "languages with equal totals should appear alphabetically: {report}"
+        );
         Ok(())
     }
 
@@ -3118,6 +6261,106 @@ fn decorated() {
     // --- New Tests ---
 
     #[test]
+    fn test_merge_directory_stats_accumulates() {
+        let mut target = HashMap::new();
+        let dir = PathBuf::from("some/dir");
+
+        let mut first = DirectoryStats::default();
+        first.language_stats.insert(
+            "Rust".to_string(),
+            (
+                1,
+                LanguageStats {
+                    code_lines: 10,
+                    comment_lines: 2,
+                    blank_lines: 1,
+                    overlap_lines: 0,
+                },
+            ),
+        );
+        merge_directory_stats(&mut target, dir.clone(), first);
+
+        let mut second = DirectoryStats::default();
+        second.language_stats.insert(
+            "Rust".to_string(),
+            (
+                2,
+                LanguageStats {
+                    code_lines: 7,
+                    comment_lines: 3,
+                    blank_lines: 0,
+                    overlap_lines: 1,
+                },
+            ),
+        );
+        second.language_stats.insert(
+            "Python".to_string(),
+            (
+                1,
+                LanguageStats {
+                    code_lines: 5,
+                    comment_lines: 1,
+                    blank_lines: 2,
+                    overlap_lines: 0,
+                },
+            ),
+        );
+        merge_directory_stats(&mut target, dir.clone(), second);
+
+        let entry = target
+            .get(&dir)
+            .expect("merged directory stats should be present");
+        let (rust_count, rust_stats) = entry
+            .language_stats
+            .get("Rust")
+            .expect("rust stats should exist after merge");
+        assert_eq!(*rust_count, 3);
+        assert_eq!(rust_stats.code_lines, 17);
+        assert_eq!(rust_stats.comment_lines, 5);
+        assert_eq!(rust_stats.blank_lines, 1);
+        assert_eq!(rust_stats.overlap_lines, 1);
+
+        let (py_count, py_stats) = entry
+            .language_stats
+            .get("Python")
+            .expect("python stats should be inserted");
+        assert_eq!(*py_count, 1);
+        assert_eq!(py_stats.code_lines, 5);
+    }
+
+    #[test]
+    fn test_scan_directory_impl_handles_file_root() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        create_test_file(root, "single.rs", "fn main() {}\n// comment\n")?;
+
+        let file_path = root.join("single.rs");
+        let mut metrics = test_metrics();
+        let mut entries_count = 0usize;
+        let mut error_count = 0usize;
+        let stats = scan_directory_impl(
+            &file_path,
+            &test_args(),
+            root,
+            &mut metrics,
+            0,
+            &mut entries_count,
+            &mut error_count,
+            None,
+        )?;
+
+        assert_eq!(error_count, 0);
+        assert_eq!(entries_count, 1);
+        let canonical_root = fs::canonicalize(root)?;
+        let dir_stats = stats
+            .get(root)
+            .or_else(|| stats.get(&canonical_root))
+            .expect("directory stats should be recorded");
+        assert!(dir_stats.language_stats.contains_key("Rust"));
+        Ok(())
+    }
+
+    #[test]
     fn test_case_insensitive_extension() {
         // Test that uppercase or mixed-case extensions are correctly recognized.
         assert_eq!(get_language_from_extension("TEST.RS"), Some("Rust"));
@@ -3138,6 +6381,7 @@ fn decorated() {
         assert_eq!(get_language_from_extension("layout.view.jsx"), Some("JSX"));
         assert_eq!(get_language_from_extension("CONFIG.CFG"), Some("INI"));
         assert_eq!(get_language_from_extension("archive.tar.gz"), None);
+        assert_eq!(get_language_from_extension("README"), None);
     }
 
     #[test]
@@ -3229,6 +6473,38 @@ fn decorated() {
             .rev()
             .collect();
         assert!(truncated.ends_with(&expected_ending));
+    }
+
+    #[test]
+    fn test_format_directory_display_variants() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let base = fs::canonicalize(temp_dir.path())?;
+        let nested = base.join("nested");
+        fs::create_dir_all(&nested)?;
+
+        let display_root = format_directory_display(&base, &base);
+        assert_eq!(display_root, ".");
+
+        let display_nested = format_directory_display(&nested, &base);
+        assert_eq!(display_nested, "nested");
+
+        let external_dir = TempDir::new()?;
+        let external = fs::canonicalize(external_dir.path())?;
+        let display_external = format_directory_display(&external, &base);
+        let tail = external
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        assert!(
+            display_external.ends_with(tail),
+            "display should include tail segment: {display_external}"
+        );
+        assert!(
+            display_external.chars().count() <= DIR_WIDTH,
+            "display should honor width limit: {display_external}"
+        );
+
+        Ok(())
     }
 
     #[test]
@@ -3419,6 +6695,244 @@ fn decorated() {
     }
 
     #[test]
+    fn test_hcl_block_comment_resumes_code_before_hash() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "combo.tf",
+            "resource \"x\" \"y\" {\n  primary = 1 /* block */ secondary = 2 # trailing hash\n}\n",
+        )?;
+        let (stats, _total_lines) = count_hcl_lines(temp_dir.path().join("combo.tf").as_path())?;
+        assert!(
+            stats.code_lines >= 4,
+            "expected code before block, after block, and braces: {stats:?}"
+        );
+        assert!(
+            stats.comment_lines >= 2,
+            "expected block and hash comments counted: {stats:?}"
+        );
+        assert_eq!(stats.blank_lines, 0, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_hcl_block_comment_multiline_then_hash_line() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "block_then_hash_line.tf",
+            "resource \"x\" \"y\" {\n  /* block\n     still comment */\n  # trailing hash\n}\n",
+        )?;
+        let (stats, _total_lines) =
+            count_hcl_lines(temp_dir.path().join("block_then_hash_line.tf").as_path())?;
+        assert!(
+            stats.comment_lines >= 3,
+            "expected block lines and hash comment counted: {stats:?}"
+        );
+        assert!(
+            stats.code_lines >= 2,
+            "expected resource header and brace counted: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_hcl_block_comment_before_line_comment() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "block_then_line.tf",
+            "resource \"x\" \"y\" {\n  attr = 1 /* block */ // trailing line comment\n}\n",
+        )?;
+        let (stats, _total_lines) =
+            count_hcl_lines(temp_dir.path().join("block_then_line.tf").as_path())?;
+        assert!(
+            stats.comment_lines >= 2,
+            "expected block and line comments: {stats:?}"
+        );
+        assert!(
+            stats.code_lines >= 2,
+            "expected code before block and closing brace: {stats:?}"
+        );
+        assert_eq!(stats.blank_lines, 0, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_hcl_block_comment_line_comment_with_code_after() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "block_line_code.tf",
+            "resource \"x\" \"y\" {\n  attr = 1 /* block */ value = 2 // trailing line comment\n}\n",
+        )?;
+        let (stats, _total_lines) =
+            count_hcl_lines(temp_dir.path().join("block_line_code.tf").as_path())?;
+        assert!(
+            stats.code_lines >= 4,
+            "expected code before block, after block, and braces: {stats:?}"
+        );
+        assert!(
+            stats.comment_lines >= 2,
+            "expected both block and line comments counted: {stats:?}"
+        );
+        assert_eq!(stats.blank_lines, 0, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_hcl_blank_lines_are_counted() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "blank_lines.tf",
+            "resource \"x\" \"y\" {\n\n  value = 1\n}\n",
+        )?;
+        let (stats, _total_lines) =
+            count_hcl_lines(temp_dir.path().join("blank_lines.tf").as_path())?;
+        assert!(
+            stats.blank_lines >= 1,
+            "expected blank separator to count as blank: {stats:?}"
+        );
+        assert!(
+            stats.code_lines >= 2,
+            "resource header and assignment should count as code: {stats:?}"
+        );
+        assert_eq!(stats.comment_lines, 0, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_hcl_block_comment_inline_code_then_line_comment() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "inline_block_line.tf",
+            "value = 1 /* block */ value2 // trailing line comment\n",
+        )?;
+        let (stats, _total_lines) =
+            count_hcl_lines(temp_dir.path().join("inline_block_line.tf").as_path())?;
+        assert!(
+            stats.comment_lines >= 2,
+            "expected block and line comments counted: {stats:?}"
+        );
+        assert!(
+            stats.code_lines >= 2,
+            "expected code before and after block counted: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_hcl_block_comment_inline_code_then_hash_comment() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "inline_block_hash.tf",
+            "value = 1 /* block */ value2 # trailing hash comment\n",
+        )?;
+        let (stats, _total_lines) =
+            count_hcl_lines(temp_dir.path().join("inline_block_hash.tf").as_path())?;
+        assert!(
+            stats.comment_lines >= 2,
+            "expected block and hash comments counted: {stats:?}"
+        );
+        assert!(
+            stats.code_lines >= 2,
+            "expected code before and after block counted: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_hcl_block_comment_inline_code_then_doc_comment() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "inline_block_doc.tf",
+            "value = 1 /* block */ value2 ## trailing doc\n",
+        )?;
+        let (stats, _total_lines) =
+            count_hcl_lines(temp_dir.path().join("inline_block_doc.tf").as_path())?;
+        assert!(
+            stats.comment_lines >= 2,
+            "expected block and doc comments counted: {stats:?}"
+        );
+        assert!(
+            stats.code_lines >= 2,
+            "expected code before and after block counted: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_hcl_multiline_block_close_trailing_code_and_comment() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "block_close_code_line.tf",
+            "resource \"x\" \"y\" {\n  attr = 1 /* block\n     still comment */ value = 2 // trailing line comment\n}\n",
+        )?;
+        let (stats, _total_lines) =
+            count_hcl_lines(temp_dir.path().join("block_close_code_line.tf").as_path())?;
+        assert!(
+            stats.code_lines >= 4,
+            "expected resource, assignments, and closing brace counted as code: {stats:?}"
+        );
+        assert!(
+            stats.comment_lines >= 3,
+            "expected block open, block close, and trailing line comment counted: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_hcl_multiline_block_close_trailing_comment_variants() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "block_close_comment_variants.tf",
+            "/* doc block\n   continues */ ## doc comment\n/* another block\n   runs */ // trailing line comment\n/* hash block\n   persists */ # trailing hash\nresource \"x\" \"y\" {}\n",
+        )?;
+        let (stats, _total_lines) = count_hcl_lines(
+            temp_dir
+                .path()
+                .join("block_close_comment_variants.tf")
+                .as_path(),
+        )?;
+        assert!(
+            stats.comment_lines >= 9,
+            "expected each block open/close and trailing comments counted: {stats:?}"
+        );
+        assert!(
+            stats.code_lines >= 1,
+            "expected resource declaration counted as code: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_hcl_line_comment_precedes_hash_comment() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "line_then_hash.tf",
+            "resource \"x\" \"y\" {\n  attr = 1 // primary # trailing\n}\n",
+        )?;
+        let (stats, _total_lines) =
+            count_hcl_lines(temp_dir.path().join("line_then_hash.tf").as_path())?;
+        assert!(
+            stats.comment_lines >= 1,
+            "expected line comment counted: {stats:?}"
+        );
+        assert!(
+            stats.code_lines >= 2,
+            "resource header and assignment should count as code: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_hcl_hash_comment_precedes_block() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
@@ -3537,6 +7051,270 @@ fn decorated() {
     }
 
     #[test]
+    fn test_velocity_line_counting_blank_and_trailing_code() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "template_blank.vm",
+            "Hello\n\n#* block start\nstill comment\n*# tail code\n",
+        )?;
+        let (stats, _total_lines) =
+            count_velocity_lines(temp_dir.path().join("template_blank.vm").as_path())?;
+        assert_eq!(
+            stats.blank_lines, 1,
+            "expected single blank separator: {stats:?}"
+        );
+        assert!(
+            stats.comment_lines >= 3,
+            "expected multiline block comment counted: {stats:?}"
+        );
+        assert!(
+            stats.code_lines >= 2,
+            "expected initial line and tail code after block: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_velocity_line_counting_block_then_line_comment() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "template_trailing.vm",
+            "Hello #* block *# ## trailing\n",
+        )?;
+        let (stats, _total_lines) =
+            count_velocity_lines(temp_dir.path().join("template_trailing.vm").as_path())?;
+        assert!(
+            stats.code_lines >= 1,
+            "expected leading code counted: {stats:?}"
+        );
+        assert!(
+            stats.comment_lines >= 2,
+            "expected block and trailing line comment: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_velocity_line_counting_multiline_block_then_line_comment() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "template_block_line.vm",
+            "Hello\n#* block start\nstill comment\n*# ## trailing\n",
+        )?;
+        let (stats, _total_lines) =
+            count_velocity_lines(temp_dir.path().join("template_block_line.vm").as_path())?;
+        assert!(
+            stats.comment_lines >= 3,
+            "expected block lines and trailing line comment counted: {stats:?}"
+        );
+        assert!(
+            stats.code_lines >= 1,
+            "expected top-level code line counted: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_velocity_multiline_block_closes_without_trailing() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "template_block_only.vm",
+            "Hello\n#* block start\nstill comment\n*#   \nValue\n",
+        )?;
+        let (stats, _total_lines) =
+            count_velocity_lines(temp_dir.path().join("template_block_only.vm").as_path())?;
+        assert!(
+            stats.comment_lines >= 3,
+            "expected block comment lines counted: {stats:?}"
+        );
+        assert!(
+            stats.code_lines >= 2,
+            "expected outer code lines counted: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_velocity_block_only_line_with_whitespace() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "template_block_whitespace.vm",
+            "#* comment-only block *#   \nNext\n",
+        )?;
+        let (stats, _total_lines) = count_velocity_lines(
+            temp_dir
+                .path()
+                .join("template_block_whitespace.vm")
+                .as_path(),
+        )?;
+        assert_eq!(
+            stats.comment_lines, 1,
+            "expected single block comment counted: {stats:?}"
+        );
+        assert!(
+            stats.code_lines >= 1,
+            "expected next line of code counted: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_velocity_inline_block_without_trailing() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "template_block_inline.vm",
+            "#* inline block *#\nValue\n",
+        )?;
+        let (stats, _total_lines) =
+            count_velocity_lines(temp_dir.path().join("template_block_inline.vm").as_path())?;
+        assert_eq!(
+            stats.comment_lines, 1,
+            "expected single block comment counted: {stats:?}"
+        );
+        assert!(
+            stats.code_lines >= 1,
+            "expected following code line counted: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_velocity_inline_block_with_whitespace_tail_only() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "template_block_inline_ws_tail.vm",
+            "Hello #* inline block *#   ",
+        )?;
+        let (stats, _total_lines) = count_velocity_lines(
+            temp_dir
+                .path()
+                .join("template_block_inline_ws_tail.vm")
+                .as_path(),
+        )?;
+        assert_eq!(
+            stats.comment_lines, 1,
+            "expected block comment counted once: {stats:?}"
+        );
+        assert_eq!(
+            stats.code_lines, 1,
+            "expected only leading code counted when trailing tail is whitespace: {stats:?}"
+        );
+        assert_eq!(
+            stats.blank_lines, 0,
+            "expected no blank lines in single-line inline block: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_velocity_inline_block_with_trailing_code() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "template_block_inline_tail.vm",
+            "Hello #* inline block *#Tail\n",
+        )?;
+        let (stats, _total_lines) = count_velocity_lines(
+            temp_dir
+                .path()
+                .join("template_block_inline_tail.vm")
+                .as_path(),
+        )?;
+        assert_eq!(
+            stats.comment_lines, 1,
+            "expected inline block counted exactly once: {stats:?}"
+        );
+        assert_eq!(
+            stats.code_lines, 2,
+            "expected both leading and trailing code counted when tail has code: {stats:?}"
+        );
+        assert_eq!(stats.blank_lines, 0, "unexpected blank lines: {stats:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_velocity_code_before_block_with_whitespace_tail() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "template_block_code_whitespace.vm",
+            "Hello #* comment *#   \nNext\n",
+        )?;
+        let (stats, _total_lines) = count_velocity_lines(
+            temp_dir
+                .path()
+                .join("template_block_code_whitespace.vm")
+                .as_path(),
+        )?;
+        assert!(
+            stats.code_lines >= 2,
+            "expected leading and trailing code counted: {stats:?}"
+        );
+        assert_eq!(
+            stats.comment_lines, 1,
+            "expected block comment counted once: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_velocity_multiline_block_closes_with_trailing_code() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "template_block_close_code.vm",
+            "#* block start\nstill comment\n*# Tail\n",
+        )?;
+        let (stats, _total_lines) = count_velocity_lines(
+            temp_dir
+                .path()
+                .join("template_block_close_code.vm")
+                .as_path(),
+        )?;
+        assert_eq!(
+            stats.comment_lines, 3,
+            "expected block lines counted as comments: {stats:?}"
+        );
+        assert_eq!(
+            stats.code_lines, 1,
+            "expected trailing code after block counted: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_velocity_multiline_block_closes_with_trailing_comment() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "template_block_close_comment.vm",
+            "#* block start\nstill comment\n*#   ## trailing\n",
+        )?;
+        let (stats, _total_lines) = count_velocity_lines(
+            temp_dir
+                .path()
+                .join("template_block_close_comment.vm")
+                .as_path(),
+        )?;
+        assert_eq!(
+            stats.comment_lines, 4,
+            "expected block lines plus trailing line comment counted: {stats:?}"
+        );
+        assert_eq!(
+            stats.code_lines, 0,
+            "expected no code counted when trailing comment consumes line: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_mustache_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
@@ -3548,6 +7326,137 @@ fn decorated() {
             count_mustache_lines(temp_dir.path().join("view.mustache").as_path())?;
         assert!(stats.code_lines >= 1);
         assert!(stats.comment_lines >= 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_mustache_line_counting_blank_line() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "view_blank.mustache",
+            "Hello {{name}}\n\n{{! trailing }}\n",
+        )?;
+        let (stats, _total_lines) =
+            count_mustache_lines(temp_dir.path().join("view_blank.mustache").as_path())?;
+        assert_eq!(
+            stats.blank_lines, 1,
+            "expected blank line counted: {stats:?}"
+        );
+        assert_eq!(
+            stats.comment_lines, 1,
+            "expected comment counted: {stats:?}"
+        );
+        assert!(
+            stats.code_lines >= 1,
+            "expected code line counted: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_mustache_line_counting_comment_with_trailing_code() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "view_trailing.mustache",
+            "{{! comment }} tail\n",
+        )?;
+        let (stats, _total_lines) =
+            count_mustache_lines(temp_dir.path().join("view_trailing.mustache").as_path())?;
+        assert_eq!(
+            stats.comment_lines, 1,
+            "expected comment counted: {stats:?}"
+        );
+        assert_eq!(
+            stats.code_lines, 1,
+            "expected trailing code counted: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_mustache_comment_only_line() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "comment_only.mustache",
+            "{{! comment only }}\nHello\n",
+        )?;
+        let (stats, _total_lines) =
+            count_mustache_lines(temp_dir.path().join("comment_only.mustache").as_path())?;
+        assert_eq!(
+            stats.comment_lines, 1,
+            "expected lone comment line counted: {stats:?}"
+        );
+        assert!(
+            stats.code_lines >= 1,
+            "expected subsequent code counted: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_mustache_inline_comment_with_surrounding_code() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "view_inline.mustache",
+            "prefix {{! inline note }} suffix\n",
+        )?;
+        let (stats, _total_lines) =
+            count_mustache_lines(temp_dir.path().join("view_inline.mustache").as_path())?;
+        assert_eq!(stats.comment_lines, 1, "stats: {:?}", stats);
+        assert!(
+            stats.code_lines >= 2,
+            "expected code counted on both sides of inline comment: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_mustache_multiline_comment_with_trailing_code() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "view_block.mustache",
+            "{{! start\ncontinues\n}} tail\n",
+        )?;
+        let (stats, _total_lines) =
+            count_mustache_lines(temp_dir.path().join("view_block.mustache").as_path())?;
+        assert!(
+            stats.comment_lines >= 3,
+            "expected each line of the block comment counted: {stats:?}"
+        );
+        assert!(
+            stats.code_lines >= 1,
+            "expected trailing code after block close counted: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_mustache_multiline_comment_without_trailing_code() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "view_block_no_tail.mustache",
+            "{{! start\ncontinues\n}}\nHello\n",
+        )?;
+        let (stats, _total_lines) = count_mustache_lines(
+            temp_dir
+                .path()
+                .join("view_block_no_tail.mustache")
+                .as_path(),
+        )?;
+        assert!(
+            stats.comment_lines >= 3,
+            "expected block comment lines counted: {stats:?}"
+        );
+        assert!(
+            stats.code_lines >= 1,
+            "expected code after block on next line counted: {stats:?}"
+        );
         Ok(())
     }
 
@@ -3834,6 +7743,25 @@ fn decorated() {
     }
 
     #[test]
+    fn test_filespec_matches_outside_root_returns_false() -> io::Result<()> {
+        let root = TempDir::new()?;
+        let external = TempDir::new()?;
+        let orphan_dir = external.path().join("orphan");
+        fs::create_dir_all(&orphan_dir)?;
+        create_test_file(&orphan_dir, "main.rs", "fn orphan() {}\n")?;
+
+        let pattern = Pattern::new("src/**/*.rs").expect("glob compiles");
+        let file_path = orphan_dir.join("main.rs");
+
+        assert!(
+            !filespec_matches(&pattern, root.path(), &file_path),
+            "files outside the root should not match by relative pattern"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_should_process_file_respects_filespec() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         let root = temp_dir.path();
@@ -4093,6 +8021,30 @@ fn decorated() {
     }
 
     #[test]
+    fn test_algol_blank_and_hash_comment_mix() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "mixed.alg",
+            "begin\n\n# hash comment\nco inline co\nCOMMENT block\nstill comment;\nend\n",
+        )?;
+        let (stats, _total) = count_algol_lines(temp_dir.path().join("mixed.alg").as_path())?;
+        assert_eq!(
+            stats.blank_lines, 1,
+            "expected single blank line: {stats:?}"
+        );
+        assert!(
+            stats.comment_lines >= 4,
+            "expected hash/co/block comment lines counted: {stats:?}"
+        );
+        assert!(
+            stats.code_lines >= 2,
+            "expected begin/end counted as code: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_cobol_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
@@ -4107,6 +8059,27 @@ fn decorated() {
     }
 
     #[test]
+    fn test_cobol_blank_and_free_comments() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "mixed.cob",
+            "       IDENTIFICATION DIVISION.\n\n      * Column seven star\n      *> free comment\n       PROGRAM-ID. SAMPLE.\n",
+        )?;
+        let (stats, _total) = count_cobol_lines(temp_dir.path().join("mixed.cob").as_path())?;
+        assert_eq!(stats.blank_lines, 1, "expected blank separator: {stats:?}");
+        assert!(
+            stats.comment_lines >= 2,
+            "expected fixed and free-form comments counted: {stats:?}"
+        );
+        assert!(
+            stats.code_lines >= 2,
+            "expected identification and program id lines counted: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_fortran_line_counting() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
@@ -4117,6 +8090,30 @@ fn decorated() {
         let (stats, _total) = count_fortran_lines(temp_dir.path().join("m.f90").as_path())?;
         assert_eq!(stats.comment_lines, 1);
         assert_eq!(stats.code_lines, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_fortran_blank_and_legacy_comments() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "mixed.f90",
+            "C legacy comment\n      PROGRAM TEST\n\n      ! full line\n      INTEGER :: X ! inline comment\n      X = 3\n      END PROGRAM TEST\n",
+        )?;
+        let (stats, _total) = count_fortran_lines(temp_dir.path().join("mixed.f90").as_path())?;
+        assert_eq!(
+            stats.blank_lines, 1,
+            "expected single blank line: {stats:?}"
+        );
+        assert!(
+            stats.comment_lines >= 3,
+            "expected legacy, full-line, and inline comments counted: {stats:?}"
+        );
+        assert!(
+            stats.code_lines >= 3,
+            "expected program, declaration, and assignment counted: {stats:?}"
+        );
         Ok(())
     }
 
@@ -4445,8 +8442,7 @@ fn decorated() {
             "sample.toml",
             "# header comment\n\nname = \"demo\" # trailing\n",
         )?;
-        let (stats, total) =
-            count_toml_lines(temp_dir.path().join("sample.toml").as_path())?;
+        let (stats, total) = count_toml_lines(temp_dir.path().join("sample.toml").as_path())?;
         assert_eq!(total, 3);
         assert_eq!(stats.code_lines, 1, "stats: {:?}", stats);
         assert_eq!(stats.comment_lines, 1, "stats: {:?}", stats);
@@ -4457,13 +8453,8 @@ fn decorated() {
     #[test]
     fn test_toml_comment_only() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
-        create_test_file(
-            temp_dir.path(),
-            "comment.toml",
-            "# header\n# detail\n",
-        )?;
-        let (stats, total) =
-            count_toml_lines(temp_dir.path().join("comment.toml").as_path())?;
+        create_test_file(temp_dir.path(), "comment.toml", "# header\n# detail\n")?;
+        let (stats, total) = count_toml_lines(temp_dir.path().join("comment.toml").as_path())?;
         assert_eq!(total, 2);
         assert_eq!(stats.code_lines, 0);
         assert_eq!(stats.comment_lines, 2);
@@ -4479,8 +8470,7 @@ fn decorated() {
             "sample.yaml",
             "\n# comment line\nkey: value\n",
         )?;
-        let (stats, total) =
-            count_yaml_lines(temp_dir.path().join("sample.yaml").as_path())?;
+        let (stats, total) = count_yaml_lines(temp_dir.path().join("sample.yaml").as_path())?;
         assert_eq!(total, 3);
         assert_eq!(stats.code_lines, 1, "stats: {:?}", stats);
         assert_eq!(stats.comment_lines, 1, "stats: {:?}", stats);
@@ -4496,8 +8486,7 @@ fn decorated() {
             "comment.yaml",
             "# only comment\n# another\n",
         )?;
-        let (stats, total) =
-            count_yaml_lines(temp_dir.path().join("comment.yaml").as_path())?;
+        let (stats, total) = count_yaml_lines(temp_dir.path().join("comment.yaml").as_path())?;
         assert_eq!(total, 2);
         assert_eq!(stats.code_lines, 0);
         assert_eq!(stats.comment_lines, 2);
@@ -4513,8 +8502,7 @@ fn decorated() {
             "Makefile",
             "# comment\n\nall:\n\t@echo done\n",
         )?;
-        let (stats, total) =
-            count_makefile_lines(temp_dir.path().join("Makefile").as_path())?;
+        let (stats, total) = count_makefile_lines(temp_dir.path().join("Makefile").as_path())?;
         assert_eq!(total, 4);
         assert_eq!(stats.code_lines, 2, "stats: {:?}", stats);
         assert_eq!(stats.comment_lines, 1, "stats: {:?}", stats);
@@ -4542,8 +8530,7 @@ fn decorated() {
             "Dockerfile",
             "FROM alpine\n# comment\n\nRUN echo hi\n",
         )?;
-        let (stats, total) =
-            count_dockerfile_lines(temp_dir.path().join("Dockerfile").as_path())?;
+        let (stats, total) = count_dockerfile_lines(temp_dir.path().join("Dockerfile").as_path())?;
         assert_eq!(total, 4);
         assert_eq!(stats.code_lines, 2, "stats: {:?}", stats);
         assert_eq!(stats.comment_lines, 1, "stats: {:?}", stats);
@@ -4554,13 +8541,8 @@ fn decorated() {
     #[test]
     fn test_dockerfile_comment_only() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
-        create_test_file(
-            temp_dir.path(),
-            "Dockerfile",
-            "# comment\n# another\n",
-        )?;
-        let (stats, total) =
-            count_dockerfile_lines(temp_dir.path().join("Dockerfile").as_path())?;
+        create_test_file(temp_dir.path(), "Dockerfile", "# comment\n# another\n")?;
+        let (stats, total) = count_dockerfile_lines(temp_dir.path().join("Dockerfile").as_path())?;
         assert_eq!(total, 2);
         assert_eq!(stats.code_lines, 0);
         assert_eq!(stats.comment_lines, 2);

@@ -180,12 +180,75 @@ fn cli_invalid_filespec_pattern_errors() {
 }
 
 #[test]
-fn cli_errors_when_max_entries_zero() {
+fn cli_prints_language_totals() {
     let temp_dir = TempDir::new().expect("failed to create temp dir");
     write_file(
         &temp_dir.path().join("main.rs"),
-        "fn main() {}\n",
+        "fn main() {}\n// comment\n",
     );
+    write_file(&temp_dir.path().join("script.py"), "print('hi')\n# note\n");
+
+    let output = Command::new(mdkloc_bin())
+        .arg(temp_dir.path())
+        .arg("--non-recursive")
+        .output()
+        .expect("failed to execute mdkloc");
+
+    assert!(
+        output.status.success(),
+        "expected success, got status {:?}, stderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Totals by language:"),
+        "stdout missing totals section: {stdout}"
+    );
+    assert!(
+        stdout.contains("Rust") && stdout.contains("Python"),
+        "stdout totals missing expected languages: {stdout}"
+    );
+}
+
+#[test]
+fn cli_reports_warning_summary_when_errors_occur() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let root = temp_dir.path();
+    write_file(&root.join("main.rs"), "fn main() {}\n// comment\n");
+    let sentinel = root.join("__mdkloc_metadata_fail__");
+    fs::create_dir(&sentinel).expect("failed to create sentinel directory");
+
+    let output = Command::new(mdkloc_bin())
+        .arg(root)
+        .env("MDKLOC_ENABLE_FAULTS", "1")
+        .output()
+        .expect("failed to execute mdkloc");
+
+    assert!(
+        output.status.success(),
+        "metadata failure should only warn, status: {:?}, stderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Error reading metadata"),
+        "stderr missing metadata warning: {stderr}"
+    );
+    assert!(
+        stdout.contains("Warning") && stdout.contains("Performance Summary"),
+        "stdout missing warning summary or performance section: {stdout}"
+    );
+}
+
+#[test]
+fn cli_errors_when_max_entries_zero() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    write_file(&temp_dir.path().join("main.rs"), "fn main() {}\n");
 
     let output = Command::new(mdkloc_bin())
         .arg(temp_dir.path())
@@ -203,5 +266,159 @@ fn cli_errors_when_max_entries_zero() {
     assert!(
         stderr.contains("Too many entries"),
         "stderr missing max entries message: {stderr}"
+    );
+}
+
+#[test]
+fn cli_filespec_handles_uppercase_extensions() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    write_file(
+        &temp_dir.path().join("KEEP.RS"),
+        "fn keep() {}\n// comment\n",
+    );
+    write_file(
+        &temp_dir.path().join("skip.py"),
+        "print('skip')\n# comment\n",
+    );
+    write_file(&temp_dir.path().join("note.txt"), "note\n");
+
+    let output = Command::new(mdkloc_bin())
+        .arg(temp_dir.path())
+        .arg("--filespec")
+        .arg("*.RS")
+        .arg("--non-recursive")
+        .output()
+        .expect("failed to execute mdkloc");
+
+    assert!(
+        output.status.success(),
+        "expected success, status: {:?}, stderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.to_ascii_uppercase().contains("RUST"),
+        "stdout should report Rust totals when uppercase filespec matches: {stdout}"
+    );
+    assert!(
+        !stdout.contains("skip.py"),
+        "stdout should omit non-matching files when filespec filters: {stdout}"
+    );
+}
+#[test]
+fn cli_filespec_and_ignore_combination() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    write_file(
+        &temp_dir.path().join("keep.rs"),
+        "fn keep() {}\n// comment\n",
+    );
+    let ignore_dir = temp_dir.path().join("ignore_me");
+    fs::create_dir(&ignore_dir).expect("failed to create ignore dir");
+    write_file(&ignore_dir.join("skip.rs"), "fn skip() {}\n");
+    write_file(&temp_dir.path().join("note.txt"), "note\n");
+
+    let output = Command::new(mdkloc_bin())
+        .arg(temp_dir.path())
+        .arg("--filespec")
+        .arg("*.rs")
+        .arg("--ignore")
+        .arg("ignore_me")
+        .output()
+        .expect("failed to execute mdkloc");
+
+    assert!(
+        output.status.success(),
+        "expected success, status: {:?}, stderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.to_ascii_uppercase().contains("RUST"),
+        "stdout should report Rust totals when filespec matches: {stdout}"
+    );
+    assert!(
+        !stdout.contains("ignore_me"),
+        "stdout should omit ignored directory from the report: {stdout}"
+    );
+}
+#[test]
+fn cli_verbose_color_combination() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    write_file(
+        &temp_dir.path().join("main.rs"),
+        "fn main() {}\n// comment\n",
+    );
+
+    let output = Command::new(mdkloc_bin())
+        .arg(temp_dir.path())
+        .arg("--verbose")
+        .arg("--ignore")
+        .arg("nonexistent")
+        .output()
+        .expect("failed to execute mdkloc");
+
+    assert!(
+        output.status.success(),
+        "expected success, status: {:?}, stderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("File:"),
+        "verbose output should list processed files: {stdout}"
+    );
+    assert!(
+        stdout.contains("main.rs"),
+        "verbose output should include the processed Rust file: {stdout}"
+    );
+}
+#[test]
+fn cli_color_filespec_ignore_combination() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    write_file(
+        &temp_dir.path().join("keep.rs"),
+        "fn keep() {}\n// comment\n",
+    );
+    let ignore_dir = temp_dir.path().join("ignore_this");
+    fs::create_dir(&ignore_dir).expect("failed to create ignore dir");
+    write_file(&ignore_dir.join("skip.rs"), "fn skip() {}\n");
+    write_file(&temp_dir.path().join("note.txt"), "note\n");
+
+    let output = Command::new(mdkloc_bin())
+        .arg(temp_dir.path())
+        .arg("--max-entries")
+        .arg("5")
+        .arg("--filespec")
+        .arg("*.rs")
+        .arg("--ignore")
+        .arg("ignore_this")
+        .output()
+        .expect("failed to execute mdkloc");
+
+    assert!(
+        output.status.success(),
+        "expected success, status: {:?}, stderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Performance Summary"),
+        "stdout should include performance summary when color is disabled: {stdout}"
+    );
+    assert!(
+        stdout.to_ascii_uppercase().contains("RUST"),
+        "stdout should report Rust totals when filespec matches: {stdout}"
+    );
+    assert!(
+        !stdout.contains("ignore_this"),
+        "stdout should omit ignored directory from the report: {stdout}"
     );
 }

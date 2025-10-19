@@ -1,0 +1,13 @@
+﻿# Coverage Progress - 2025-10-18
+
+## Recent Work
+- Expanded Python docstring edge cases with fixtures covering trailing code, trailing comments, blank lines, whitespace-only lines, whitespace-plus-comment sequences, and the new `doc_with_whitespace_code.py` case that resumes code after a whitespace separator—exercising the branch range around lines 670-686 in `count_python_lines`.
+- Added YAML and TOML inline hash-comment fixtures, fully driving `count_hash_comment_lines` across comment/blank/code permutations.
+- Extended HCL coverage with both multi-line and unterminated block-comment fixtures, and introduced mixed HCL/INI fixtures (`combo.tf`, `mixed.tf`, `mixed.ini`) that close block comments mid-line before trailing hash comments, covering `count_hcl_lines` and dispatcher logic near lines 1228 and 3060.
+- Added focused fixtures for `/* ... */ //` transitions (`block_then_line.tf`, `block_line_code.tf`), line-comment-to-hash sequences (`line_then_hash.tf`), blank separators (`blank_lines.tf`), dispatcher case-insensitivity/uppercase coverage (`CONFIG.INI`, `SETTINGS.CFG`, `variables.TFVARS`, `variables.TfVars.json`, `SAMPLE.CONF`), new Velocity scenarios covering blank lines plus block-closure trailing code and trailing line comments (with `count_velocity_lines` now treating trailing `##`/`//`/`#` as comments), new Mustache fixtures that hit blank-line and trailing-code-after-comment paths, additional HCL fixtures (`inline_block_line.tf`, `inline_block_hash.tf`, `block_then_hash_line.tf`, `inline_block_doc.tf`) that place hash or line comments immediately after inline and multiline blocks, dispatcher regressions for `terraform.tfvars.json` variants, and nested scan-directory failure-injection tests that ensure metadata/read_dir errors increment counts without blowing away sibling stats.
+- Verifying suite continues to pass (`cargo fmt`, `cargo test`, `cargo llvm-cov`) and the 2025-10-18 coverage run sits at Regions 76.50%, Lines 95.84%, Functions 95.96% (`cargo llvm-cov --workspace --summary-only --show-missing-lines`).
+
+## Next Steps
+1. Review the remaining `count_hcl_lines` uncovered span around lines 1339-1355 (now the debug-assert branch) to confirm whether additional markers need handling or the loop can be simplified further.
+2. Address the lingering dispatcher hot spots near 3050 by broadening fixtures for other mixed-case config extensions (e.g., `.TfVars.json` variants with additional suffixes) and nested cases if coverage still flags those paths after the latest uppercase additions.
+3. Continue the `cargo fmt`, `cargo test`, and `cargo llvm-cov --workspace --summary-only --show-missing-lines` cadence after each fixture to track incremental improvements.
