@@ -12,6 +12,7 @@
 use clap::{ArgAction, Parser};
 use std::collections::HashMap;
 use std::env;
+use std::ffi::OsString;
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -22,6 +23,9 @@ use glob::Pattern;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+#[cfg(test)]
+use std::sync::OnceLock;
 
 // Fixed width for the directory column.
 const DIR_WIDTH: usize = 40;
@@ -843,40 +847,56 @@ fn count_javascript_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> 
             }
             continue;
         }
-        if trimmed.starts_with("/*") {
-            stats.comment_lines += 1;
-            if let Some(before_comment) = trimmed.split("/*").next() {
-                if !before_comment.trim().is_empty() {
+        let line_pos = trimmed.find("//");
+        let block_pos = trimmed.find("/*");
+        let jsx_pos = trimmed.find("<!--");
+
+        if let Some(pl) = line_pos {
+            if block_pos.map_or(true, |pb| pl < pb) && jsx_pos.map_or(true, |pj| pl < pj) {
+                let before = &trimmed[..pl];
+                if !before.trim().is_empty() {
                     stats.code_lines += 1;
                 }
+                stats.comment_lines += 1;
+                continue;
             }
-            if !trimmed.contains("*/") {
+        }
+
+        if let Some(pos) = block_pos {
+            let before = &trimmed[..pos];
+            if !before.trim().is_empty() {
+                stats.code_lines += 1;
+            }
+            stats.comment_lines += 1;
+            let after = &trimmed[(pos + 2)..];
+            if let Some(end) = after.find("*/") {
+                let trailing = &after[(end + 2)..];
+                if !trailing.trim().is_empty()
+                    && !trailing.trim_start().starts_with("//")
+                    && !trailing.trim_start().starts_with("<#")
+                {
+                    stats.code_lines += 1;
+                }
+            } else {
                 in_block_comment = true;
-            } else if let Some(after_comment) = trimmed.split("*/").nth(1) {
-                if !after_comment.trim().is_empty() && !after_comment.trim().starts_with("//") {
-                    stats.code_lines += 1;
-                }
             }
             continue;
         }
-        if trimmed.starts_with("<!--") {
+        if let Some(pos) = jsx_pos {
+            let before = &trimmed[..pos];
+            if !before.trim().is_empty() {
+                stats.code_lines += 1;
+            }
             stats.comment_lines += 1;
-            if let Some(before_comment) = trimmed.split("<!--").next() {
-                if !before_comment.trim().is_empty() {
+            let after = &trimmed[(pos + 4)..];
+            if let Some(end) = after.find("-->") {
+                let trailing = &after[(end + 3)..];
+                if !trailing.trim().is_empty() {
                     stats.code_lines += 1;
                 }
-            }
-            if !trimmed.contains("-->") {
+            } else {
                 in_jsx_comment = true;
-            } else if let Some(after_comment) = trimmed.split("-->").nth(1) {
-                if !after_comment.trim().is_empty() {
-                    stats.code_lines += 1;
-                }
             }
-            continue;
-        }
-        if trimmed.starts_with("//") {
-            stats.comment_lines += 1;
             continue;
         }
         stats.code_lines += 1;
@@ -2312,9 +2332,47 @@ fn build_analysis_report(
 }
 
 fn main() -> io::Result<()> {
-    let args = Args::parse();
+    run_with_args(current_args())
+}
+
+#[cfg(test)]
+fn current_args() -> Vec<OsString> {
+    take_override_args().unwrap_or_else(|| env::args_os().collect())
+}
+
+#[cfg(not(test))]
+fn current_args() -> Vec<OsString> {
+    env::args_os().collect()
+}
+
+fn run_with_args<I, T>(args: I) -> io::Result<()>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    let args = Args::parse_from(args);
     let mut metrics = PerformanceMetrics::new();
     run_cli_with_metrics(args, &mut metrics)
+}
+
+#[cfg(test)]
+static TEST_ARGS_OVERRIDE: OnceLock<std::sync::Mutex<Option<Vec<OsString>>>> = OnceLock::new();
+
+#[cfg(test)]
+fn take_override_args() -> Option<Vec<OsString>> {
+    TEST_ARGS_OVERRIDE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.take())
+}
+
+#[cfg(test)]
+fn set_override_args(args: Vec<OsString>) {
+    let mutex = TEST_ARGS_OVERRIDE.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(mut guard) = mutex.lock() {
+        *guard = Some(args);
+    }
 }
 
 fn run_cli_with_metrics(args: Args, metrics: &mut PerformanceMetrics) -> io::Result<()> {
@@ -2369,6 +2427,7 @@ mod tests {
     use super::*;
     use colored::control;
     use std::env;
+    use std::ffi::OsString;
     use std::fs::{self, File};
     use std::io::{self, Write};
     use std::path::{Path, PathBuf};
@@ -2415,6 +2474,36 @@ mod tests {
         fn drop(&mut self) {
             let _ = env::set_current_dir(&self.original);
         }
+    }
+
+    #[test]
+    fn test_performance_metrics_new_defaults() {
+        let mut metrics = PerformanceMetrics::new();
+        assert!(
+            metrics.progress_enabled,
+            "expected progress enabled by default"
+        );
+        assert_eq!(
+            metrics.files_processed.load(Ordering::Relaxed),
+            0,
+            "files counter should start at zero"
+        );
+        assert_eq!(
+            metrics.lines_processed.load(Ordering::Relaxed),
+            0,
+            "lines counter should start at zero"
+        );
+        metrics.update(7);
+        assert_eq!(
+            metrics.files_processed.load(Ordering::Relaxed),
+            1,
+            "file counter should increment after update"
+        );
+        assert_eq!(
+            metrics.lines_processed.load(Ordering::Relaxed),
+            7,
+            "line counter should accumulate after update"
+        );
     }
 
     #[test]
@@ -3118,6 +3207,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_run_with_args_executes_cli() -> io::Result<()> {
+        control::set_override(false);
+        let temp_dir = TempDir::new()?;
+        create_test_file(temp_dir.path(), "sample.rs", "fn main() {}\n// comment\n")?;
+        let args = vec![
+            OsString::from("mdkloc"),
+            temp_dir.path().as_os_str().to_os_string(),
+            OsString::from("--non-recursive"),
+        ];
+        run_with_args(args)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_main_uses_override_args() -> io::Result<()> {
+        control::set_override(false);
+        let temp_dir = TempDir::new()?;
+        create_test_file(temp_dir.path(), "main.rs", "fn main() {}\n// comment\n")?;
+        let args = vec![
+            OsString::from("mdkloc"),
+            temp_dir.path().as_os_str().to_os_string(),
+            OsString::from("--non-recursive"),
+        ];
+        set_override_args(args);
+        let result = super::main();
+        assert!(
+            result.is_ok(),
+            "main should run successfully with override args: {result:?}"
+        );
+        Ok(())
+    }
+
     impl Write for CaptureWriter {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             let mut guard = self.buffer.lock().expect("lock poisoned");
@@ -3584,6 +3706,41 @@ mod tests {
         assert!(
             error_count >= 1,
             "file type failure should increment error count, got {error_count}"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_scan_directory_impl_skips_special_file() -> io::Result<()> {
+        use std::os::unix::net::UnixListener;
+
+        let temp_dir = TempDir::new()?;
+        let socket_path = temp_dir.path().join("listener.sock");
+        let _listener = UnixListener::bind(&socket_path)?;
+
+        let args = test_args();
+        let mut metrics = test_metrics();
+        let mut entries_count = 0usize;
+        let mut error_count = 0usize;
+        let stats = scan_directory_impl(
+            &socket_path,
+            &args,
+            temp_dir.path(),
+            &mut metrics,
+            0,
+            &mut entries_count,
+            &mut error_count,
+            None,
+        )?;
+
+        assert!(
+            stats.is_empty(),
+            "special file should not contribute stats: {stats:?}"
+        );
+        assert_eq!(
+            error_count, 0,
+            "special file should be skipped without error increment"
         );
         Ok(())
     }
@@ -6131,8 +6288,8 @@ fn decorated() {
         )?;
         let (stats, _total_lines) =
             count_javascript_lines(temp_dir.path().join("mix.js").as_path())?;
-        assert_eq!(stats.code_lines, 2, "stats: {:?}", stats);
-        assert_eq!(stats.comment_lines, 2, "stats: {:?}", stats);
+        assert_eq!(stats.code_lines, 3, "stats: {:?}", stats);
+        assert_eq!(stats.comment_lines, 3, "stats: {:?}", stats);
         Ok(())
     }
 
@@ -6162,8 +6319,75 @@ fn decorated() {
         let (stats, _total_lines) =
             count_javascript_lines(temp_dir.path().join("jsx_mix.js").as_path())?;
         assert_eq!(stats.code_lines, 8, "stats: {:?}", stats);
-        assert_eq!(stats.comment_lines, 7, "stats: {:?}", stats);
+        assert_eq!(stats.comment_lines, 8, "stats: {:?}", stats);
         assert_eq!(stats.blank_lines, 0, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_javascript_prefers_line_comment_over_block() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "line_vs_block.js",
+            "const value = 1; // comment /* not a block */\n",
+        )?;
+        let (stats, _total_lines) =
+            count_javascript_lines(temp_dir.path().join("line_vs_block.js").as_path())?;
+        assert_eq!(
+            stats.code_lines, 1,
+            "expected code before // counted: {stats:?}"
+        );
+        assert_eq!(
+            stats.comment_lines, 1,
+            "expected line comment counted: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_javascript_jsx_comment_with_prefix_code() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "jsx_prefix.js",
+            "const header = '<div>'; <!-- comment --> const footer = '</div>';\n",
+        )?;
+        let (stats, _total_lines) =
+            count_javascript_lines(temp_dir.path().join("jsx_prefix.js").as_path())?;
+        assert!(
+            stats.code_lines >= 2,
+            "expected code before and after JSX comment: {stats:?}"
+        );
+        assert!(
+            stats.comment_lines >= 1,
+            "expected JSX comment counted: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_javascript_blank_line_and_jsx_tail() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "blank_mix.js",
+            "// header comment\n\nconst view = () => <div>ok</div>; /* inline */\n<!-- jsx block\ncontinues --> <span>tail</span>\n",
+        )?;
+        let (stats, _total_lines) =
+            count_javascript_lines(temp_dir.path().join("blank_mix.js").as_path())?;
+        assert!(
+            stats.blank_lines >= 1,
+            "expected blank line counted: {stats:?}"
+        );
+        assert!(
+            stats.comment_lines >= 2,
+            "expected block and JSX comments counted: {stats:?}"
+        );
+        assert!(
+            stats.code_lines >= 2,
+            "expected code before/after comments counted: {stats:?}"
+        );
         Ok(())
     }
 
@@ -6255,6 +6479,105 @@ fn decorated() {
         assert_eq!(stats.code_lines, 5, "stats: {:?}", stats);
         assert_eq!(stats.comment_lines, 9, "stats: {:?}", stats);
         assert_eq!(stats.blank_lines, 0, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_pascal_blank_lines_and_comment_tails() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "blank_tails.pas",
+            "program Blank;\n\nbegin\nvalue := 1; { brace } tail;\nvalue := 2; (* paren *) tail2;\nend.\n",
+        )?;
+        let (stats, _total_lines) =
+            count_pascal_lines(temp_dir.path().join("blank_tails.pas").as_path())?;
+        assert!(
+            stats.blank_lines >= 1,
+            "expected blank line counted: {stats:?}"
+        );
+        assert!(
+            stats.comment_lines >= 2,
+            "expected brace and paren comments counted: {stats:?}"
+        );
+        assert!(
+            stats.code_lines >= 4,
+            "expected code before/after comments counted: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_language_blank_line_tracking() -> io::Result<()> {
+        let cases: Vec<(
+            &str,
+            &str,
+            fn(&Path) -> io::Result<(LanguageStats, u64)>,
+            &str,
+        )> = vec![
+            (
+                "blank.php",
+                "<?php\n\n$foo = 1; /* block */\n/* open\ncontinues */\n?>\n",
+                count_php_lines,
+                "PHP",
+            ),
+            (
+                "blank.rb",
+                "#!/usr/bin/env ruby\n\n=begin\nblock\n=end\nputs 'done'\n",
+                count_ruby_lines,
+                "Ruby",
+            ),
+            (
+                "blank.sh",
+                "#!/bin/sh\n\n# comment\nprintf 'hi'\n",
+                count_shell_lines,
+                "Shell",
+            ),
+            (
+                "blank.asm",
+                "; leading comment\n\nmov ax, bx\n",
+                count_asm_lines,
+                "Assembly",
+            ),
+            (
+                "blank.com",
+                "$ SET DEFAULT\n\n! comment line\n$ EXIT\n",
+                count_dcl_lines,
+                "DCL",
+            ),
+            (
+                "blank.bat",
+                "@echo off\n\nREM comment\n:: alternate\n",
+                count_batch_lines,
+                "Batch",
+            ),
+            (
+                "blank.tcl",
+                "#!/usr/bin/env tclsh\n\n# comment\nputs {hi}\n",
+                count_tcl_lines,
+                "TCL",
+            ),
+            (
+                "blank.xml",
+                "<root>\n<!-- comment -->\n\n<child />\n</root>\n",
+                count_xml_like_lines,
+                "XML",
+            ),
+        ];
+
+        for (file_name, contents, counter, label) in cases {
+            let temp_dir = TempDir::new()?;
+            create_test_file(temp_dir.path(), file_name, contents)?;
+            let (stats, _total_lines) = counter(&temp_dir.path().join(file_name))?;
+            assert!(
+                stats.blank_lines >= 1,
+                "{label} should count at least one blank line, stats: {stats:?}"
+            );
+            assert!(
+                stats.code_lines + stats.comment_lines > 0,
+                "{label} should classify non-blank content, stats: {stats:?}"
+            );
+        }
         Ok(())
     }
 
@@ -7562,6 +7885,73 @@ fn decorated() {
     }
 
     #[test]
+    fn test_cstyle_line_comment_counts_code_prefix() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "line_comment.c",
+            "int value = 42; // trailing comment\n",
+        )?;
+        let (stats, _total_lines) =
+            count_c_style_lines(temp_dir.path().join("line_comment.c").as_path())?;
+        assert_eq!(
+            stats.code_lines, 1,
+            "expected code before // counted: {stats:?}"
+        );
+        assert_eq!(
+            stats.comment_lines, 1,
+            "expected trailing // counted: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_cstyle_block_then_line_unterminated() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "block_unterminated.c",
+            "int start = 0; /* begin // still comment\n*/ int done = 1;\n",
+        )?;
+        let (stats, _total_lines) =
+            count_c_style_lines(temp_dir.path().join("block_unterminated.c").as_path())?;
+        assert!(
+            stats.comment_lines >= 2,
+            "expected multi-line block comment recorded: {stats:?}"
+        );
+        assert!(
+            stats.code_lines >= 2,
+            "expected code before and after block recorded: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_cstyle_blank_line_and_unterminated_block() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "blank_block.c",
+            "int a = 0;\n\n/* block starts\nstill comment\n*/ int b = 1;\n",
+        )?;
+        let (stats, _total_lines) =
+            count_c_style_lines(temp_dir.path().join("blank_block.c").as_path())?;
+        assert!(
+            stats.blank_lines >= 1,
+            "expected blank line counted: {stats:?}"
+        );
+        assert!(
+            stats.comment_lines >= 2,
+            "expected multi-line block comment counted: {stats:?}"
+        );
+        assert!(
+            stats.code_lines >= 2,
+            "expected code before/after block counted: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_php_inline_block_comment() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
@@ -7758,6 +8148,26 @@ fn decorated() {
             "files outside the root should not match by relative pattern"
         );
 
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_filespec_matches_invalid_utf_path() -> io::Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        let pattern = Pattern::new("*.txt").expect("glob compiles");
+        let bytes = [0xFFu8, b'n', b'o', b't', b'e', b'.', b't', b'x', b't'];
+        let os_name = std::ffi::OsStr::from_bytes(&bytes);
+        let file_path = root.join(os_name);
+        File::create(&file_path)?;
+
+        assert!(
+            !filespec_matches(&pattern, root, &file_path),
+            "invalid UTF path should not match pattern"
+        );
         Ok(())
     }
 
@@ -8007,6 +8417,52 @@ fn decorated() {
     }
 
     #[test]
+    fn test_powershell_blank_line_and_multiline_block() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "blank_block.ps1",
+            "Write-Host \"start\"\n\n<# open\nstill comment\n#>\nWrite-Host \"after\"\n",
+        )?;
+        let (stats, _total_lines) =
+            count_powershell_lines(temp_dir.path().join("blank_block.ps1").as_path())?;
+        assert!(
+            stats.blank_lines >= 1,
+            "expected blank line counted: {stats:?}"
+        );
+        assert!(
+            stats.comment_lines >= 2,
+            "expected block comment lines counted: {stats:?}"
+        );
+        assert!(
+            stats.code_lines >= 2,
+            "expected code before/after block counted: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_powershell_block_and_line_comment_without_close() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "line_block.ps1",
+            "Write-Host 1 <# start block # trailing\n#> Write-Host 2\n",
+        )?;
+        let (stats, _total_lines) =
+            count_powershell_lines(temp_dir.path().join("line_block.ps1").as_path())?;
+        assert!(
+            stats.comment_lines >= 2,
+            "expected block and line comments counted: {stats:?}"
+        );
+        assert!(
+            stats.code_lines >= 2,
+            "expected code before and after comments counted: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_algol_comment_with_semicolon_same_line() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
@@ -8241,6 +8697,52 @@ fn decorated() {
         assert_eq!(stats.code_lines, 4, "stats: {:?}", stats);
         assert_eq!(stats.comment_lines, 5, "stats: {:?}", stats);
         assert_eq!(stats.blank_lines, 0, "stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
+    fn test_iplan_blank_line_and_block_tail() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "blank_block.ipl",
+            "SET BASE = 1\n\n/* start\ncontinues */ VALUE\n/* reopen\nstill comment\n*/ VALUE2\n! trailing\n",
+        )?;
+        let (stats, _total_lines) =
+            count_iplan_lines(temp_dir.path().join("blank_block.ipl").as_path())?;
+        assert!(
+            stats.blank_lines >= 1,
+            "expected blank line counted: {stats:?}"
+        );
+        assert!(
+            stats.comment_lines >= 3,
+            "expected multi-line block comments counted: {stats:?}"
+        );
+        assert!(
+            stats.code_lines >= 3,
+            "expected code after block comments counted: {stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_iplan_block_trailing_code_on_same_line() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "inline_tail.ipl",
+            "/* header */ VALUE1\nVALUE2 /* close */ VALUE3\n",
+        )?;
+        let (stats, _total_lines) =
+            count_iplan_lines(temp_dir.path().join("inline_tail.ipl").as_path())?;
+        assert_eq!(
+            stats.comment_lines, 2,
+            "expected two comment lines: {stats:?}"
+        );
+        assert!(
+            stats.code_lines >= 3,
+            "expected code detected before and after comments: {stats:?}"
+        );
         Ok(())
     }
 
