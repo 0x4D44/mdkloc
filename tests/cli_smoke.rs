@@ -8,6 +8,13 @@ fn mdkloc_bin() -> &'static str {
     env!("CARGO_BIN_EXE_mdkloc")
 }
 
+#[cfg(unix)]
+fn create_symlink(src: &Path, dst: &Path) {
+    use std::os::unix::fs::symlink;
+
+    symlink(src, dst).expect("failed to create symlink");
+}
+
 fn write_file(path: &Path, contents: &str) {
     fs::write(path, contents).expect("failed to write test file");
 }
@@ -44,6 +51,35 @@ fn cli_prints_summary_for_basic_run() {
     assert!(
         stdout.contains("Rust"),
         "stdout missing Rust language totals: {stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_counts_symlinked_files_once() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let root = temp_dir.path();
+    let actual = root.join("actual.rs");
+    let alias = root.join("alias.rs");
+    write_file(&actual, "fn main() {}\n// real file\n");
+    create_symlink(&actual, &alias);
+
+    let output = Command::new(mdkloc_bin())
+        .arg(root)
+        .output()
+        .expect("failed to execute mdkloc");
+
+    assert!(
+        output.status.success(),
+        "expected success, got status {:?}, stderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Total files processed: 1"),
+        "symlinked file should count once, stdout: {stdout}"
     );
 }
 
@@ -176,6 +212,34 @@ fn cli_invalid_filespec_pattern_errors() {
     assert!(
         stderr.contains("Invalid filespec pattern"),
         "stderr missing filespec error: {stderr}"
+    );
+}
+
+#[test]
+fn cli_enforces_max_entries_before_filters() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let root = temp_dir.path();
+    write_file(&root.join("match.rs"), "fn main() {}\n");
+    write_file(&root.join("skip.txt"), "// not counted\n");
+
+    let output = Command::new(mdkloc_bin())
+        .arg(root)
+        .arg("--filespec")
+        .arg("*.rs")
+        .arg("--max-entries")
+        .arg("1")
+        .output()
+        .expect("failed to execute mdkloc");
+
+    assert!(
+        !output.status.success(),
+        "max entries guard should fail the run, status: {:?}",
+        output.status.code()
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Maximum entry limit"),
+        "stderr missing max entry message: {stderr}"
     );
 }
 

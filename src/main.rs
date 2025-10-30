@@ -10,7 +10,7 @@
 //! Algol, COBOL, Fortran, Assembly, DCL, IPLAN.
 
 use clap::{ArgAction, Parser};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsString;
 use std::fmt::Write as FmtWrite;
@@ -1947,6 +1947,21 @@ fn filespec_matches(pattern: &Pattern, root_path: &Path, file_path: &Path) -> bo
     pattern.matches(&rel_str)
 }
 
+fn increment_entries(entries_count: &mut usize, args: &Args, entry_path: &Path) -> io::Result<()> {
+    *entries_count += 1;
+    if *entries_count > args.max_entries {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!(
+                "Maximum entry limit ({}) exceeded while scanning {}",
+                args.max_entries,
+                entry_path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn process_file(
     file_path: &Path,
@@ -1954,17 +1969,36 @@ fn process_file(
     root_path: &Path,
     metrics: &mut PerformanceMetrics,
     stats: &mut HashMap<PathBuf, DirectoryStats>,
-    entries_count: &mut usize,
     error_count: &mut usize,
     filespec: Option<&Pattern>,
+    visited_real_paths: &mut HashSet<PathBuf>,
 ) -> io::Result<()> {
     if !should_process_file(filespec, root_path, file_path) {
         return Ok(());
     }
 
-    *entries_count += 1;
-    if *entries_count > args.max_entries {
-        return Err(io::Error::other("Too many entries in directory tree"));
+    let real_path = match fs::canonicalize(file_path) {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!(
+                "Error resolving real path for {}: {}",
+                file_path.display(),
+                err
+            );
+            *error_count += 1;
+            return Ok(());
+        }
+    };
+
+    if !visited_real_paths.insert(real_path.clone()) {
+        if args.verbose {
+            println!(
+                "Skipping duplicate target for symlinked file: {} -> {}",
+                file_path.display(),
+                real_path.display()
+            );
+        }
+        return Ok(());
     }
 
     let Some(language) = file_path
@@ -2026,6 +2060,7 @@ fn scan_directory_impl(
     entries_count: &mut usize,
     error_count: &mut usize,
     filespec: Option<&Pattern>,
+    visited_real_paths: &mut HashSet<PathBuf>,
 ) -> io::Result<HashMap<PathBuf, DirectoryStats>> {
     if current_depth > args.max_depth {
         eprintln!(
@@ -2058,15 +2093,16 @@ fn scan_directory_impl(
     };
 
     if metadata.is_file() {
+        increment_entries(entries_count, args, path)?;
         process_file(
             path,
             args,
             root_path,
             metrics,
             &mut stats,
-            entries_count,
             error_count,
             filespec,
+            visited_real_paths,
         )?;
         return Ok(stats);
     }
@@ -2104,6 +2140,8 @@ fn scan_directory_impl(
             }
         };
 
+        increment_entries(entries_count, args, &entry_path)?;
+
         if file_type.is_dir() && !file_type.is_symlink() {
             if args.non_recursive {
                 continue;
@@ -2117,6 +2155,7 @@ fn scan_directory_impl(
                 entries_count,
                 error_count,
                 filespec,
+                visited_real_paths,
             ) {
                 Ok(sub_stats) => {
                     for (dir, stat) in sub_stats {
@@ -2135,10 +2174,41 @@ fn scan_directory_impl(
                 root_path,
                 metrics,
                 &mut stats,
-                entries_count,
                 error_count,
                 filespec,
+                visited_real_paths,
             )?;
+        } else if file_type.is_symlink() {
+            match fetch_metadata(&entry_path) {
+                Ok(target_metadata) => {
+                    if target_metadata.is_dir() {
+                        if args.verbose {
+                            println!("Skipping symlinked directory: {}", entry_path.display());
+                        }
+                        continue;
+                    }
+                    if target_metadata.is_file() {
+                        process_file(
+                            &entry_path,
+                            args,
+                            root_path,
+                            metrics,
+                            &mut stats,
+                            error_count,
+                            filespec,
+                            visited_real_paths,
+                        )?;
+                    }
+                }
+                Err(err) => {
+                    eprintln!(
+                        "Error resolving metadata for symlink {}: {}",
+                        entry_path.display(),
+                        err
+                    );
+                    *error_count += 1;
+                }
+            }
         }
     }
 
@@ -2165,6 +2235,7 @@ fn scan_directory(
     };
 
     let root_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut visited_real_paths = HashSet::new();
 
     scan_directory_impl(
         &root_path,
@@ -2175,6 +2246,7 @@ fn scan_directory(
         entries_count,
         error_count,
         filespec_pattern.as_ref(),
+        &mut visited_real_paths,
     )
 }
 
@@ -2956,20 +3028,23 @@ mod tests {
     fn test_process_file_missing_source_increments_error() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         let missing = temp_dir.path().join("ghost.rs");
+        let args = test_args();
         let mut metrics = test_metrics();
         let mut stats = std::collections::HashMap::new();
         let mut entries_count = 0usize;
         let mut error_count = 0usize;
+        let mut visited_paths = HashSet::new();
 
+        increment_entries(&mut entries_count, &args, &missing)?;
         process_file(
             &missing,
-            &test_args(),
+            &args,
             temp_dir.path(),
             &mut metrics,
             &mut stats,
-            &mut entries_count,
             &mut error_count,
             None,
+            &mut visited_paths,
         )?;
 
         assert!(stats.is_empty());
@@ -2993,16 +3068,19 @@ mod tests {
         let mut stats = std::collections::HashMap::new();
         let mut entries_count = 0usize;
         let mut error_count = 0usize;
+        let mut visited_paths = HashSet::new();
 
+        let verbose_path = temp_dir.path().join("verbose.rs");
+        increment_entries(&mut entries_count, &args, &verbose_path)?;
         process_file(
-            &temp_dir.path().join("verbose.rs"),
+            &verbose_path,
             &args,
             temp_dir.path(),
             &mut metrics,
             &mut stats,
-            &mut entries_count,
             &mut error_count,
             None,
+            &mut visited_paths,
         )?;
 
         let dir_stats = stats
@@ -3723,6 +3801,7 @@ mod tests {
         let mut metrics = test_metrics();
         let mut entries_count = 0usize;
         let mut error_count = 0usize;
+        let mut visited_paths = HashSet::new();
         let stats = scan_directory_impl(
             &socket_path,
             &args,
@@ -3732,6 +3811,7 @@ mod tests {
             &mut entries_count,
             &mut error_count,
             None,
+            &mut visited_paths,
         )?;
 
         assert!(
@@ -3741,6 +3821,113 @@ mod tests {
         assert_eq!(
             error_count, 0,
             "special file should be skipped without error increment"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_symlinked_file_counted_once() -> io::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        create_test_file(root, "actual.rs", "fn main() {}\n")?;
+
+        let target = root.join("actual.rs");
+        let symlink_path = root.join("alias.rs");
+        symlink(&target, &symlink_path)?;
+
+        let mut metrics = test_metrics();
+        let mut entries = 0usize;
+        let mut errors = 0usize;
+        let mut visited_paths = HashSet::new();
+
+        let stats = scan_directory_impl(
+            root,
+            &test_args(),
+            root,
+            &mut metrics,
+            0,
+            &mut entries,
+            &mut errors,
+            None,
+            &mut visited_paths,
+        )?;
+
+        let canonical_root = fs::canonicalize(root)?;
+        let dir_stats = stats
+            .get(root)
+            .or_else(|| stats.get(&canonical_root))
+            .expect("root directory stats should exist after scanning symlink");
+        let (file_count, lang_stats) = dir_stats
+            .language_stats
+            .get("Rust")
+            .expect("Rust stats should be present");
+
+        assert_eq!(*file_count, 1, "symlinked file should count only once");
+        assert_eq!(lang_stats.code_lines, 1);
+        assert_eq!(entries, 2, "should count both the file and symlink entries");
+        assert_eq!(errors, 0, "symlink processing should not add errors");
+        assert_eq!(
+            visited_paths.len(),
+            1,
+            "only the resolved canonical file should be tracked once"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_max_entries_limit_applies_before_filters() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        create_test_file(root, "match.rs", "fn main() {}\n")?;
+        create_test_file(root, "skip.txt", "// not rust\n")?;
+
+        let mut args = test_args();
+        args.max_entries = 1;
+        args.filespec = Some("*.rs".to_string());
+
+        let mut metrics = test_metrics();
+        let mut entries = 0usize;
+        let mut errors = 0usize;
+        let mut visited_paths = HashSet::new();
+
+        let filespec_pattern = args
+            .filespec
+            .as_deref()
+            .map(|spec| Pattern::new(spec).expect("valid pattern"));
+
+        let result = scan_directory_impl(
+            root,
+            &args,
+            root,
+            &mut metrics,
+            0,
+            &mut entries,
+            &mut errors,
+            filespec_pattern.as_ref(),
+            &mut visited_paths,
+        );
+
+        match result {
+            Ok(_) => panic!("expected max entries limit to error when exceeded"),
+            Err(err) => {
+                let message = err.to_string();
+                assert!(
+                    message.contains("Maximum entry limit"),
+                    "error message should mention the entry limit: {message}"
+                );
+            }
+        }
+
+        assert_eq!(
+            entries, 2,
+            "entry counter should include both filtered and skipped files"
+        );
+        assert_eq!(
+            errors, 0,
+            "entry limit enforcement should not increment error count automatically"
         );
         Ok(())
     }
@@ -3936,6 +4123,7 @@ mod tests {
         let mut merged: HashMap<PathBuf, DirectoryStats> = HashMap::new();
 
         for _ in 0..2 {
+            let mut visited_paths = HashSet::new();
             let sub_stats = scan_directory_impl(
                 &shared,
                 &test_args(),
@@ -3945,6 +4133,7 @@ mod tests {
                 &mut entries,
                 &mut errors,
                 None,
+                &mut visited_paths,
             )?;
             for (dir, stat) in sub_stats {
                 merge_directory_stats(&mut merged, dir, stat);
@@ -4266,6 +4455,7 @@ mod tests {
         let mut metrics = test_metrics();
         let mut entries = 0usize;
         let mut errors = 0usize;
+        let mut visited_paths = HashSet::new();
         let stats = scan_directory_impl(
             &nested,
             &args,
@@ -4275,6 +4465,7 @@ mod tests {
             &mut entries,
             &mut errors,
             None,
+            &mut visited_paths,
         )?;
 
         assert!(
@@ -6661,6 +6852,7 @@ fn decorated() {
         let mut metrics = test_metrics();
         let mut entries_count = 0usize;
         let mut error_count = 0usize;
+        let mut visited_paths = HashSet::new();
         let stats = scan_directory_impl(
             &file_path,
             &test_args(),
@@ -6670,6 +6862,7 @@ fn decorated() {
             &mut entries_count,
             &mut error_count,
             None,
+            &mut visited_paths,
         )?;
 
         assert_eq!(error_count, 0);
