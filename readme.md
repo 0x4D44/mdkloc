@@ -179,9 +179,17 @@ cargo fmt
 cargo clippy -- -D warnings
 cargo test
 cargo llvm-cov --workspace --summary-only
+
+# For coverage enforcement at ≥98% lines, ≥95% regions, and ≥96% functions
+# (excludes inline unit-test file):
+cargo llvm-cov --summary-only \
+  --ignore-filename-regex 'src/tests_included.rs$' \
+  --fail-under-lines 98 \
+  --fail-under-regions 95 \
+  --fail-under-functions 96
 ```
 
-See `docs/2025.10.17 - Coverage Recovery Plan.md` for the latest coverage targets and follow-up actions.
+See `docs/2025.10.17 - Coverage Recovery Plan.md` and `wrk_docs/2025.10.30 - PLAN - Path to 95 lines.md` for targets and follow-up actions.
 
 The project includes comprehensive tests covering:
 - Directory scanning

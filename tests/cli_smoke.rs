@@ -83,6 +83,71 @@ fn cli_counts_symlinked_files_once() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn cli_skips_symlinked_directories_verbose() {
+    use std::os::unix::fs::symlink;
+
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let root = temp_dir.path();
+
+    // Real directory with a real file
+    let real_dir = root.join("real");
+    fs::create_dir(&real_dir).expect("failed to create real dir");
+    write_file(&real_dir.join("main.rs"), "fn main(){}\n");
+
+    // Symlinked directory pointing to the real directory
+    let alias_dir = root.join("alias");
+    symlink(&real_dir, &alias_dir).expect("failed to create symlinked dir");
+
+    let output = Command::new(mdkloc_bin())
+        .arg(root)
+        .arg("--verbose")
+        .output()
+        .expect("failed to execute mdkloc");
+
+    assert!(
+        output.status.success(),
+        "expected success: {:?}",
+        output.status
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Skipping symlinked directory:"),
+        "stdout should mention skipping symlinked directory when verbose: {stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_reports_duplicate_symlinked_file_target_verbose() {
+    use std::os::unix::fs::symlink;
+
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let root = temp_dir.path();
+    let actual = root.join("actual.rs");
+    let alias = root.join("alias.rs");
+    write_file(&actual, "fn main() {}\n// real file\n");
+    symlink(&actual, &alias).expect("failed to create file symlink");
+
+    let output = Command::new(mdkloc_bin())
+        .arg(root)
+        .arg("--verbose")
+        .output()
+        .expect("failed to execute mdkloc");
+
+    assert!(
+        output.status.success(),
+        "expected success: {:?}",
+        output.status
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Skipping duplicate target for symlinked file"),
+        "stdout should mention duplicate symlinked target when verbose: {stdout}"
+    );
+}
+
 #[test]
 fn cli_respects_non_recursive_and_ignore() {
     let temp_dir = TempDir::new().expect("failed to create temp dir");
@@ -277,6 +342,117 @@ fn cli_prints_language_totals() {
 }
 
 #[test]
+fn cli_exercises_language_parsers() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let root = temp_dir.path();
+
+    // JavaScript with block and JSX-style comments
+    write_file(
+        &root.join("app.js"),
+        "const a = 1; /* block */ const b = 2;\n<!-- jsx open\ncontinues --> tail\n",
+    );
+    // PHP with block then trailing code and hash
+    write_file(
+        &root.join("index.php"),
+        "<?php\n$y = 1; /* c */ echo $y; # note\n",
+    );
+    // Perl POD
+    write_file(
+        &root.join("script.pl"),
+        "print 'x';\n=pod\nPOD body\n=cut\nprint 'y';\n",
+    );
+    // Ruby block and shebang
+    write_file(
+        &root.join("script.rb"),
+        "#!/usr/bin/env ruby\n=begin\nblock\n=end\nputs 'hi'\n",
+    );
+    // Shell shebang
+    write_file(&root.join("run.sh"), "#!/bin/sh\n# c\necho hi\n");
+    // Pascal nested comments
+    write_file(
+        &root.join("p.pas"),
+        "{c1} (*c2*) code\n(* multi\nline *) code2\n",
+    );
+    // Makefile
+    write_file(&root.join("Makefile"), "all:\n\t@echo hi\n");
+    // HCL / Terraform
+    write_file(&root.join("main.tf"), "a=1 /*c*/ b=2 # tail\n");
+    // CMake
+    write_file(&root.join("CMakeLists.txt"), "project(x) # note\n");
+    // INI
+    write_file(&root.join("settings.ini"), "name=value ; inline\n# x\n");
+    // TOML
+    write_file(&root.join("Cargo.toml"), "[p]\nname='x' # i\n");
+    // JSON
+    write_file(&root.join("a.json"), "{\n  \"k\": 1\n}\n");
+    // XML
+    write_file(&root.join("a.xml"), "<a><!-- c --><b/></a>\n");
+    // HTML
+    write_file(
+        &root.join("index.html"),
+        "<html><!-- c --><body>t</body></html>\n",
+    );
+    // Velocity and Mustache
+    write_file(&root.join("t.vm"), "## line\n#* block *# tail\n");
+    write_file(&root.join("view.mustache"), "{{! c }} Hello {{name}}\n");
+    // Algol, COBOL, Fortran, ASM, DCL, IPLAN, Protobuf
+    write_file(&root.join("a.alg"), "begin\nCOMMENT x;\nend\n");
+    write_file(
+        &root.join("c.cob"),
+        "       IDENTIFICATION DIVISION.\n      *> c\n       PROGRAM-ID. X.\n",
+    );
+    write_file(&root.join("f.f90"), "! c\nprogram x\nend\n");
+    write_file(&root.join("x.asm"), "; c\nmov eax, eax\n");
+    write_file(&root.join("proc.com"), "$! c\n$ exit\n");
+    write_file(&root.join("x.ipl"), "/* c */\nVALUE\n");
+    write_file(&root.join("m.proto"), "// c\nsyntax = \"proto3\";\n");
+    // SVG + XSL (XML family)
+    write_file(&root.join("pic.svg"), "<svg><!-- c --></svg>\n");
+    write_file(
+        &root.join("sheet.xsl"),
+        "<xsl:stylesheet><!-- c --></xsl:stylesheet>\n",
+    );
+    // PowerShell, Batch, TCL
+    write_file(&root.join("a.ps1"), "# c\nWrite-Host 'x'\n");
+    write_file(&root.join("b.bat"), "REM c\n@echo on\n");
+    write_file(&root.join("c.tcl"), "# c\nputs \"x\"\n");
+
+    let output = Command::new(mdkloc_bin())
+        .arg(root)
+        .arg("--non-recursive")
+        .output()
+        .expect("failed to execute mdkloc");
+
+    assert!(
+        output.status.success(),
+        "expected success: {:?}",
+        output.status
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Spot check a few languages appeared, implying their parsers ran
+    for lang in [
+        "JavaScript",
+        "PHP",
+        "Perl",
+        "Ruby",
+        "Shell",
+        "Pascal",
+        "HCL",
+        "CMake",
+        "INI",
+        "TOML",
+        "JSON",
+        "XML",
+        "HTML",
+    ] {
+        assert!(
+            stdout.contains(lang),
+            "expected language '{lang}' in totals; stdout: {stdout}"
+        );
+    }
+}
+
+#[test]
 fn cli_reports_warning_summary_when_errors_occur() {
     let temp_dir = TempDir::new().expect("failed to create temp dir");
     let root = temp_dir.path();
@@ -310,6 +486,52 @@ fn cli_reports_warning_summary_when_errors_occur() {
 }
 
 #[test]
+fn cli_injected_read_dir_failure() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let root = temp_dir.path();
+
+    // Create a subdirectory whose name triggers a simulated read_dir failure.
+    let fail_dir = root.join("__mdkloc_read_dir_fail__");
+    fs::create_dir(&fail_dir).expect("failed to create failing dir");
+
+    let output = Command::new(mdkloc_bin())
+        .arg(root)
+        .env("MDKLOC_ENABLE_FAULTS", "1")
+        .output()
+        .expect("failed to execute mdkloc");
+
+    assert!(output.status.success(), "status: {:?}", output.status);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Error reading directory"),
+        "stderr should contain read_dir error: {stderr}"
+    );
+}
+
+#[test]
+fn cli_injected_file_type_failure() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let root = temp_dir.path();
+
+    // Create an entry whose name triggers a simulated file_type failure.
+    let fail_entry = root.join("__mdkloc_file_type_fail__.rs");
+    write_file(&fail_entry, "fn z(){}\n");
+
+    let output = Command::new(mdkloc_bin())
+        .arg(root)
+        .env("MDKLOC_ENABLE_FAULTS", "1")
+        .output()
+        .expect("failed to execute mdkloc");
+
+    assert!(output.status.success(), "status: {:?}", output.status);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Error reading type for"),
+        "stderr should contain file_type error: {stderr}"
+    );
+}
+
+#[test]
 fn cli_errors_when_max_entries_zero() {
     let temp_dir = TempDir::new().expect("failed to create temp dir");
     write_file(&temp_dir.path().join("main.rs"), "fn main() {}\n");
@@ -328,7 +550,7 @@ fn cli_errors_when_max_entries_zero() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Too many entries"),
+        stderr.contains("Maximum entry limit"),
         "stderr missing max entries message: {stderr}"
     );
 }
@@ -484,5 +706,40 @@ fn cli_color_filespec_ignore_combination() {
     assert!(
         !stdout.contains("ignore_this"),
         "stdout should omit ignored directory from the report: {stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_processes_symlink_to_external_file() {
+    use std::os::unix::fs::symlink;
+
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let root = temp_dir.path();
+
+    // Create the real file outside the scanned root.
+    let ext_dir = TempDir::new().expect("failed to create external dir");
+    let real = ext_dir.path().join("real.rs");
+    write_file(&real, "fn outside(){}\n// note\n");
+
+    // Create a symlink inside the root pointing to the external file.
+    let link = root.join("link.rs");
+    symlink(&real, &link).expect("failed to create symlink to external file");
+
+    // Scan the root; should process the symlinked file as a regular file.
+    let output = Command::new(mdkloc_bin())
+        .arg(root)
+        .output()
+        .expect("failed to execute mdkloc");
+
+    assert!(output.status.success(), "status: {:?}", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.to_ascii_uppercase().contains("RUST"),
+        "totals should include Rust: {stdout}"
+    );
+    assert!(
+        stdout.contains("Total files processed: 1"),
+        "should count exactly one file via symlink: {stdout}"
     );
 }

@@ -39,6 +39,19 @@ jobs:
       - name: Test
         run: cargo test --all --all-features
 
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Coverage (lines >= 98%, regions >= 95%, functions >= 96%)
+        run: |
+          cargo llvm-cov --summary-only \
+            --ignore-filename-regex 'src/tests_included.rs$' \
+            --fail-under-lines 98 \
+            --fail-under-regions 95 \
+            --fail-under-functions 96
+
       - name: Build release
         run: cargo build --release --all-features
 
