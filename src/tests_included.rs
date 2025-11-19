@@ -18,6 +18,7 @@
             max_depth: 100,
             non_recursive: false,
             filespec: None,
+            role_breakdown: false,
         }
     }
 
@@ -30,6 +31,63 @@
         let mut file = File::create(path)?;
         write!(file, "{}", content)?;
         Ok(())
+    }
+
+    fn language_entry(files: u64, stats: LanguageStats) -> LanguageEntry {
+        let mut entry = LanguageEntry::default();
+        entry.record_aggregate(CodeRole::Mainline, files, stats);
+        entry
+    }
+
+    #[test]
+    fn test_language_entry_noop_on_empty_roles() {
+        let mut entry = LanguageEntry::default();
+        entry.record_roles(&[]);
+        assert_eq!(entry.total_files(), 0, "empty roles should not increment file count");
+        assert!(
+            entry.role_summary(CodeRole::Mainline).is_none(),
+            "no role stats should be present"
+        );
+    }
+
+    #[test]
+    fn test_language_entry_role_summary_accumulates() {
+        let mut entry = LanguageEntry::default();
+        entry.record_roles(&[
+            (
+                CodeRole::Mainline,
+                LanguageStats {
+                    code_lines: 3,
+                    comment_lines: 1,
+                    blank_lines: 0,
+                    overlap_lines: 0,
+                },
+            ),
+            (
+                CodeRole::Test,
+                LanguageStats {
+                    code_lines: 2,
+                    comment_lines: 0,
+                    blank_lines: 1,
+                    overlap_lines: 0,
+                },
+            ),
+        ]);
+        let (files, main_stats) = entry
+            .role_summary(CodeRole::Mainline)
+            .expect("mainline stats missing");
+        assert_eq!(files, 1);
+        assert_eq!(main_stats.code_lines, 3);
+
+        let (files, test_stats) = entry
+            .role_summary(CodeRole::Test)
+            .expect("test stats missing");
+        assert_eq!(files, 1);
+        assert_eq!(test_stats.blank_lines, 1);
+
+        let (total_files, totals) = entry.summary();
+        assert_eq!(total_files, 1);
+        assert_eq!(totals.code_lines, 5);
     }
 
     struct CurrentDirGuard {
@@ -67,6 +125,10 @@
             0,
             "lines counter should start at zero"
         );
+        for (files, lines) in metrics.role_counters() {
+            assert_eq!(files, 0, "role files should start at zero");
+            assert_eq!(lines, 0, "role lines should start at zero");
+        }
         metrics.update(7);
         assert_eq!(
             metrics.files_processed.load(Ordering::Relaxed),
@@ -77,6 +139,18 @@
             metrics.lines_processed.load(Ordering::Relaxed),
             7,
             "line counter should accumulate after update"
+        );
+        metrics.record_role(CodeRole::Test, 5);
+        let counters = metrics.role_counters();
+        assert_eq!(
+            counters[CodeRole::Test.as_index()].0,
+            1,
+            "test role file counter should record increments"
+        );
+        assert_eq!(
+            counters[CodeRole::Test.as_index()].1,
+            5,
+            "test role line counter should record increments"
         );
     }
 
@@ -591,11 +665,66 @@
         let (file_count, lang_stats) = dir_stats
             .language_stats
             .get("Rust")
-            .expect("expected Rust stats for verbose file");
-        assert_eq!(*file_count, 1);
+            .expect("expected Rust stats for verbose file")
+            .summary();
+        assert_eq!(file_count, 1);
         assert!(lang_stats.code_lines >= 1);
         assert_eq!(error_count, 0);
         assert_eq!(entries_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_process_file_verbose_prints_role_labels() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "verbose_split.rs",
+            r#"
+pub fn prod() {}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn sample() {
+        super::prod();
+    }
+}
+"#,
+        )?;
+
+        let mut args = test_args();
+        args.verbose = true;
+        let mut metrics = test_metrics();
+        let mut stats = std::collections::HashMap::new();
+        let mut entries_count = 0usize;
+        let mut error_count = 0usize;
+        let mut visited_paths = HashSet::new();
+
+        let verbose_path = temp_dir.path().join("verbose_split.rs");
+        increment_entries(&mut entries_count, &args, &verbose_path)?;
+        process_file(
+            &verbose_path,
+            &args,
+            temp_dir.path(),
+            &mut metrics,
+            &mut stats,
+            &mut error_count,
+            None,
+            &mut visited_paths,
+        )?;
+
+        let dir_stats = stats
+            .get(temp_dir.path())
+            .expect("verbose split scan should record directory stats");
+        let entry = dir_stats
+            .language_stats
+            .get("Rust")
+            .expect("expected Rust stats");
+        assert!(
+            entry.role_summary(CodeRole::Test).is_some(),
+            "expected test role to record stats"
+        );
         Ok(())
     }
 
@@ -966,19 +1095,21 @@
             .get(&root_canon)
             .or_else(|| stats.get(temp_dir.path()))
             .unwrap();
-        let main_rust_stats = main_stats.language_stats.get("Rust").unwrap();
-        assert_eq!(main_rust_stats.0, 1);
-        assert_eq!(main_rust_stats.1.code_lines, 3);
-        assert_eq!(main_rust_stats.1.comment_lines, 1);
+        let main_rust_entry = main_stats.language_stats.get("Rust").unwrap();
+        let (main_rust_files, main_rust_stats) = main_rust_entry.summary();
+        assert_eq!(main_rust_files, 1);
+        assert_eq!(main_rust_stats.code_lines, 3);
+        assert_eq!(main_rust_stats.comment_lines, 1);
         let sub_canon = fs::canonicalize(&sub_dir)?;
         let sub_stats = stats
             .get(&sub_canon)
             .or_else(|| stats.get(&sub_dir))
             .unwrap();
-        let sub_rust_stats = sub_stats.language_stats.get("Rust").unwrap();
-        assert_eq!(sub_rust_stats.0, 1);
-        assert_eq!(sub_rust_stats.1.code_lines, 3);
-        assert_eq!(sub_rust_stats.1.comment_lines, 1);
+        let sub_rust_entry = sub_stats.language_stats.get("Rust").unwrap();
+        let (sub_rust_files, sub_rust_stats) = sub_rust_entry.summary();
+        assert_eq!(sub_rust_files, 1);
+        assert_eq!(sub_rust_stats.code_lines, 3);
+        assert_eq!(sub_rust_stats.comment_lines, 1);
         Ok(())
     }
 
@@ -1019,12 +1150,13 @@
         let root_stats = stats
             .get(&root_canon)
             .expect("root stats should exist after scanning");
-        let rust_entry = root_stats
+        let (file_count, rust_stats) = root_stats
             .language_stats
             .get("Rust")
-            .expect("Rust stats should be present");
-        assert_eq!(rust_entry.0, 1);
-        assert_eq!(rust_entry.1.code_lines, 1);
+            .expect("Rust stats should be present")
+            .summary();
+        assert_eq!(file_count, 1);
+        assert_eq!(rust_stats.code_lines, 1);
         Ok(())
     }
 
@@ -1365,9 +1497,10 @@
         let (file_count, lang_stats) = dir_stats
             .language_stats
             .get("Rust")
-            .expect("Rust stats should be present");
+            .expect("Rust stats should be present")
+            .summary();
 
-        assert_eq!(*file_count, 1, "symlinked file should count only once");
+        assert_eq!(file_count, 1, "symlinked file should count only once");
         assert_eq!(lang_stats.code_lines, 1);
         assert_eq!(entries, 2, "should count both the file and symlink entries");
         assert_eq!(errors, 0, "symlink processing should not add errors");
@@ -1376,6 +1509,45 @@
             1,
             "only the resolved canonical file should be tracked once"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_directory_visits_symlink_branch() -> io::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        create_test_file(root, "real.rs", "fn main() {}\n")?;
+
+        let link = root.join("link.rs");
+        symlink(root.join("real.rs"), &link)?;
+
+        let mut metrics = test_metrics();
+        let mut entries = 0usize;
+        let mut errors = 0usize;
+        let stats = scan_directory(
+            root,
+            &test_args(),
+            root,
+            &mut metrics,
+            0,
+            &mut entries,
+            &mut errors,
+        )?;
+
+        assert_eq!(errors, 0);
+        let root_canon = fs::canonicalize(root)?;
+        let dir_stats = stats
+            .get(&root_canon)
+            .or_else(|| stats.get(root))
+            .expect("expected stats for root directory");
+        let (files, _) = dir_stats
+            .language_stats
+            .get("Rust")
+            .expect("rust stats missing")
+            .summary();
+        assert_eq!(files, 1, "symlinked file should be processed once");
         Ok(())
     }
 
@@ -1653,17 +1825,18 @@
             .get(&shared_key)
             .or_else(|| merged.get(&shared))
             .expect("shared directory stats should exist after merging duplicates");
-        let rust_entry = shared_stats
+        let (rust_files, rust_stats) = shared_stats
             .language_stats
             .get("Rust")
-            .expect("Rust stats should be present after merge");
+            .expect("Rust stats should be present after merge")
+            .summary();
         assert_eq!(
-            rust_entry.0, 2,
-            "expected file count to accumulate across duplicate merges: {rust_entry:?}"
+            rust_files, 2,
+            "expected file count to accumulate across duplicate merges"
         );
         assert_eq!(
-            rust_entry.1.code_lines, 2,
-            "code lines should accumulate across duplicate merges: {rust_entry:?}"
+            rust_stats.code_lines, 2,
+            "code lines should accumulate across duplicate merges: {rust_stats:?}"
         );
 
         Ok(())
@@ -2284,13 +2457,14 @@
             .or_else(|| stats.get(&parent_canonical))
             .expect("directory stats should capture file root processing");
         drop(guard);
-        let (lang, (file_total, lang_stats)) = dir_stats
+        let (lang, entry) = dir_stats
             .language_stats
             .iter()
             .next()
             .expect("language stats should contain Rust entry");
         assert_eq!(lang.as_str(), "Rust");
-        assert_eq!(*file_total, 1, "expected exactly one Rust file recorded");
+        let (file_total, lang_stats) = entry.summary();
+        assert_eq!(file_total, 1, "expected exactly one Rust file recorded");
         assert_eq!(
             lang_stats.code_lines, 1,
             "expected code line from main function; stats: {lang_stats:?}"
@@ -3640,7 +3814,7 @@ fn decorated() {
         let mut dir_stats = DirectoryStats::default();
         dir_stats.language_stats.insert(
             "Rust".to_string(),
-            (
+            language_entry(
                 1,
                 LanguageStats {
                     code_lines: 3,
@@ -3652,7 +3826,7 @@ fn decorated() {
         );
         dir_stats.language_stats.insert(
             "Python".to_string(),
-            (
+            language_entry(
                 2,
                 LanguageStats {
                     code_lines: 4,
@@ -3664,7 +3838,7 @@ fn decorated() {
         );
         stats_map.insert(temp_dir.path().to_path_buf(), dir_stats);
 
-        let report = build_analysis_report(temp_dir.path(), &stats_map, 3, 11, 1);
+        let report = build_analysis_report(temp_dir.path(), &stats_map, 3, 11, 1, false);
         assert!(
             report.contains("Totals by language:"),
             "report should include totals header: {report}"
@@ -3685,10 +3859,42 @@ fn decorated() {
     }
 
     #[test]
+    fn test_build_analysis_report_role_breakdown_no_data() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let mut stats_map = HashMap::new();
+        let mut dir_stats = DirectoryStats::default();
+        dir_stats.language_stats.insert(
+            "Rust".to_string(),
+            language_entry(
+                1,
+                LanguageStats {
+                    code_lines: 2,
+                    comment_lines: 0,
+                    blank_lines: 0,
+                    overlap_lines: 0,
+                },
+            ),
+        );
+        stats_map.insert(temp_dir.path().to_path_buf(), dir_stats);
+
+        let report =
+            build_analysis_report(temp_dir.path(), &stats_map, 1, 2, 0, true);
+        assert!(
+            report.contains("Role breakdown (Mainline)"),
+            "expected mainline section: {report}"
+        );
+        assert!(
+            report.contains("Role breakdown (Test)") && report.contains("No test data collected."),
+            "expected fallback message when no test data exists: {report}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_build_analysis_report_handles_zero_totals() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         let stats_map: HashMap<PathBuf, DirectoryStats> = HashMap::new();
-        let report = build_analysis_report(temp_dir.path(), &stats_map, 0, 0, 0);
+        let report = build_analysis_report(temp_dir.path(), &stats_map, 0, 0, 0, false);
         assert!(
             report.contains("Detailed source code analysis"),
             "report should always include table header: {report}"
@@ -3721,7 +3927,7 @@ fn decorated() {
         let mut src_stats = DirectoryStats::default();
         src_stats.language_stats.insert(
             "Rust".to_string(),
-            (
+            language_entry(
                 2,
                 LanguageStats {
                     code_lines: 10,
@@ -3733,7 +3939,7 @@ fn decorated() {
         );
         src_stats.language_stats.insert(
             "Python".to_string(),
-            (
+            language_entry(
                 1,
                 LanguageStats {
                     code_lines: 5,
@@ -3745,14 +3951,15 @@ fn decorated() {
         );
 
         let mut docs_stats = DirectoryStats::default();
-        docs_stats
-            .language_stats
-            .insert("Markdown".to_string(), (1, LanguageStats::default()));
+        docs_stats.language_stats.insert(
+            "Markdown".to_string(),
+            language_entry(1, LanguageStats::default()),
+        );
 
         let mut outside_stats = DirectoryStats::default();
         outside_stats.language_stats.insert(
             "Shell".to_string(),
-            (
+            language_entry(
                 1,
                 LanguageStats {
                     code_lines: 0,
@@ -3767,7 +3974,7 @@ fn decorated() {
         stats_map.insert(docs_dir.clone(), docs_stats);
         stats_map.insert(outside_dir.clone(), outside_stats);
 
-        let report = build_analysis_report(current, &stats_map, 4, 13, 0);
+        let report = build_analysis_report(current, &stats_map, 4, 13, 0, false);
 
         assert!(
             report.contains("src"),
@@ -3810,7 +4017,7 @@ fn decorated() {
         let mut dir_stats = DirectoryStats::default();
         dir_stats.language_stats.insert(
             "Rust".to_string(),
-            (
+            language_entry(
                 1,
                 LanguageStats {
                     code_lines: 3,
@@ -3832,7 +4039,7 @@ fn decorated() {
             "truncated display should not exceed DIR_WIDTH: {display}"
         );
 
-        let report = build_analysis_report(base, &stats_map, 1, 3, 0);
+        let report = build_analysis_report(base, &stats_map, 1, 3, 0, false);
         assert!(
             report.contains(&display),
             "report should contain truncated directory display: {report}"
@@ -3852,7 +4059,7 @@ fn decorated() {
         let mut dir_stats = DirectoryStats::default();
         dir_stats.language_stats.insert(
             "Zig".to_string(),
-            (
+            language_entry(
                 1,
                 LanguageStats {
                     code_lines: 4,
@@ -3864,7 +4071,7 @@ fn decorated() {
         );
         dir_stats.language_stats.insert(
             "Ada".to_string(),
-            (
+            language_entry(
                 1,
                 LanguageStats {
                     code_lines: 4,
@@ -3876,7 +4083,7 @@ fn decorated() {
         );
         stats_map.insert(temp_dir.path().to_path_buf(), dir_stats);
 
-        let report = build_analysis_report(temp_dir.path(), &stats_map, 2, 8, 0);
+        let report = build_analysis_report(temp_dir.path(), &stats_map, 2, 8, 0, false);
         let ada_idx = report.find("Ada");
         let zig_idx = report.find("Zig");
         assert!(
@@ -4271,7 +4478,7 @@ fn decorated() {
         let mut first = DirectoryStats::default();
         first.language_stats.insert(
             "Rust".to_string(),
-            (
+            language_entry(
                 1,
                 LanguageStats {
                     code_lines: 10,
@@ -4286,7 +4493,7 @@ fn decorated() {
         let mut second = DirectoryStats::default();
         second.language_stats.insert(
             "Rust".to_string(),
-            (
+            language_entry(
                 2,
                 LanguageStats {
                     code_lines: 7,
@@ -4298,7 +4505,7 @@ fn decorated() {
         );
         second.language_stats.insert(
             "Python".to_string(),
-            (
+            language_entry(
                 1,
                 LanguageStats {
                     code_lines: 5,
@@ -4316,8 +4523,9 @@ fn decorated() {
         let (rust_count, rust_stats) = entry
             .language_stats
             .get("Rust")
-            .expect("rust stats should exist after merge");
-        assert_eq!(*rust_count, 3);
+            .expect("rust stats should exist after merge")
+            .summary();
+        assert_eq!(rust_count, 3);
         assert_eq!(rust_stats.code_lines, 17);
         assert_eq!(rust_stats.comment_lines, 5);
         assert_eq!(rust_stats.blank_lines, 1);
@@ -4326,8 +4534,9 @@ fn decorated() {
         let (py_count, py_stats) = entry
             .language_stats
             .get("Python")
-            .expect("python stats should be inserted");
-        assert_eq!(*py_count, 1);
+            .expect("python stats should be inserted")
+            .summary();
+        assert_eq!(py_count, 1);
         assert_eq!(py_stats.code_lines, 5);
     }
 
@@ -5509,8 +5718,8 @@ fn decorated() {
         // Count Rust files aggregated across all dirs in stats
         let mut rust_files = 0u64;
         for dir in stats.values() {
-            if let Some((n, _)) = dir.language_stats.get("Rust") {
-                rust_files += *n;
+            if let Some(entry) = dir.language_stats.get("Rust") {
+                rust_files += entry.total_files();
             }
         }
         assert_eq!(rust_files, 2); // root and child only
@@ -5545,11 +5754,257 @@ fn decorated() {
         )?;
         // Assert only Rust present
         for dir in stats.values() {
-            for (lang, (n, _)) in &dir.language_stats {
+            for (lang, entry) in &dir.language_stats {
                 assert_eq!(lang.as_str(), "Rust");
-                assert_eq!(*n, 1);
+                assert_eq!(entry.total_files(), 1);
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_infer_role_from_path_detects_tests_directory() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        let tests_dir = root.join("tests").join("integration");
+        fs::create_dir_all(&tests_dir)?;
+        let file_path = tests_dir.join("case.rs");
+        create_test_file(&tests_dir, "case.rs", "fn main() {}\n")?;
+        let role = infer_role_from_path(root, &file_path);
+        assert_eq!(role, FileRoleHint::TestFile);
+        Ok(())
+    }
+
+    #[test]
+    fn test_infer_role_from_path_detects_test_suffixes() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        let src_dir = root.join("src");
+        fs::create_dir_all(&src_dir)?;
+        let file_path = src_dir.join("widget_test.rs");
+        create_test_file(&src_dir, "widget_test.rs", "fn widget() {}\n")?;
+        assert_eq!(
+            infer_role_from_path(root, &file_path),
+            FileRoleHint::TestFile
+        );
+
+        let prod_file = src_dir.join("widget.rs");
+        create_test_file(&src_dir, "widget.rs", "fn widget() {}\n")?;
+        assert_eq!(
+            infer_role_from_path(root, &prod_file),
+            FileRoleHint::Unknown
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_rust_role_tracker_handles_cfg_not_test() {
+        let lines = vec![
+            "#[cfg(not(test))]".to_string(),
+            "fn prod_only() {}".to_string(),
+        ];
+        let roles = detect_rust_line_roles(&lines, FileRoleHint::Unknown);
+        assert_eq!(roles, vec![CodeRole::Mainline, CodeRole::Mainline]);
+    }
+
+    #[test]
+    fn test_rust_role_tracker_pending_scope_with_semicolon_item() {
+        let lines = vec![
+            "#[cfg(test)]".to_string(),
+            "mod tests;".to_string(),
+            "fn mainline() {}".to_string(),
+        ];
+        let roles = detect_rust_line_roles(&lines, FileRoleHint::Unknown);
+        assert_eq!(roles[0], CodeRole::Test);
+        assert_eq!(roles[1], CodeRole::Test);
+        assert_eq!(roles[2], CodeRole::Mainline);
+    }
+
+    #[test]
+    fn test_detect_rust_line_roles_handles_raw_strings() {
+        let lines = vec![
+            "fn main() {".to_string(),
+            "    let s = r#\"#[cfg(test)]\"#;".to_string(),
+            "}".to_string(),
+        ];
+        let roles = detect_rust_line_roles(&lines, FileRoleHint::Unknown);
+        assert_eq!(roles, vec![CodeRole::Mainline; 3]);
+    }
+
+    #[test]
+    fn test_detect_rust_line_roles_handles_char_literals() {
+        let lines = vec![
+            "fn main() {".to_string(),
+            "    let c = '#';".to_string(),
+            "}".to_string(),
+        ];
+        let roles = detect_rust_line_roles(&lines, FileRoleHint::Unknown);
+        assert_eq!(roles, vec![CodeRole::Mainline; 3]);
+    }
+
+    #[test]
+    fn test_rust_role_counter_block_comment_variants() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        let file_path = root.join("lib.rs");
+        create_test_file(
+            root,
+            "lib.rs",
+            r#"
+pub fn prod() { /* comment */ }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn block_comment_spans_lines() {
+        /*
+            multi-line
+        */
+        assert_eq!(2 + 2, 4);
+    }
+}
+"#,
+        )?;
+        let split = count_rust_lines_role_aware(&file_path, FileRoleHint::Unknown)?;
+        let main = split
+            .bucket(CodeRole::Mainline)
+            .expect("mainline stats missing");
+        let test = split
+            .bucket(CodeRole::Test)
+            .expect("test stats missing");
+        assert!(
+            main.stats.comment_lines >= 1,
+            "expected block comment to count in mainline: {:?}",
+            main.stats
+        );
+        assert!(
+            test.stats.comment_lines >= 2,
+            "expected multi-line block comment counted in tests: {:?}",
+            test.stats
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_rust_role_counter_empty_test_file_defaults_to_test() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        let tests_dir = root.join("tests");
+        fs::create_dir_all(&tests_dir)?;
+        create_test_file(&tests_dir, "empty.rs", "")?;
+        let file_path = tests_dir.join("empty.rs");
+        let split = count_rust_lines_role_aware(&file_path, FileRoleHint::TestFile)?;
+        assert!(
+            split.bucket(CodeRole::Mainline).is_none(),
+            "empty integration test should not have mainline stats"
+        );
+        let test_bucket = split
+            .bucket(CodeRole::Test)
+            .expect("test bucket missing");
+        assert_eq!(test_bucket.stats.blank_lines, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_infer_role_from_path_nested_tests_dir() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        let nested = root.join("crates").join("sample").join("tests");
+        fs::create_dir_all(&nested)?;
+        let file_path = nested.join("case.rs");
+        create_test_file(&nested, "case.rs", "fn main() {}\n")?;
+        assert_eq!(
+            infer_role_from_path(root, &file_path),
+            FileRoleHint::TestFile
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_infer_role_from_path_spec_suffix() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        let file_path = root.join("widget.spec.ts");
+        create_test_file(root, "widget.spec.ts", "console.log('hi');\n")?;
+        assert_eq!(
+            infer_role_from_path(root, &file_path),
+            FileRoleHint::TestFile
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_attribute_indicates_test_variants() {
+        assert!(attribute_indicates_test("#[cfg(test)]"));
+        assert!(attribute_indicates_test("#[cfg(any(test, feature = \"x\"))]"));
+        assert!(!attribute_indicates_test("#[cfg(not(test))]"));
+        assert!(attribute_indicates_test("#[test]"));
+        assert!(attribute_indicates_test("#[tokio::test]"));
+    }
+
+    #[test]
+    fn test_rust_inline_tests_split_roles() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        let file_path = root.join("lib.rs");
+        create_test_file(
+            root,
+            "lib.rs",
+            r#"
+pub fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adds_numbers() {
+        assert_eq!(add(2, 2), 4);
+    }
+}
+"#,
+        )?;
+        let split = count_lines_with_roles(&file_path, FileRoleHint::Unknown)?;
+        let main = split
+            .bucket(CodeRole::Mainline)
+            .expect("expected mainline bucket");
+        let test = split
+            .bucket(CodeRole::Test)
+            .expect("expected test bucket");
+        assert!(
+            main.stats.code_lines > 0 && test.stats.code_lines > 0,
+            "both roles should contain code: main={:?} test={:?}",
+            main.stats,
+            test.stats
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_rust_tests_directory_infers_test_role() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        let tests_dir = root.join("tests");
+        fs::create_dir_all(&tests_dir)?;
+        create_test_file(
+            &tests_dir,
+            "integration.rs",
+            "fn helper() {}\n// comment\n",
+        )?;
+        let file_path = tests_dir.join("integration.rs");
+        let hint = infer_role_from_path(root, &file_path);
+        assert_eq!(hint, FileRoleHint::TestFile);
+        let split = count_lines_with_roles(&file_path, hint)?;
+        assert!(
+            split.bucket(CodeRole::Mainline).is_none(),
+            "integration tests should count as test role only"
+        );
+        let test = split
+            .bucket(CodeRole::Test)
+            .expect("test bucket should exist");
+        assert!(test.stats.code_lines >= 1);
         Ok(())
     }
 
@@ -5676,7 +6131,7 @@ fn decorated() {
 
         let rust_files: u64 = stats
             .values()
-            .flat_map(|dir| dir.language_stats.get("Rust").map(|(n, _)| *n))
+            .flat_map(|dir| dir.language_stats.get("Rust").map(|entry| entry.total_files()))
             .sum();
         assert_eq!(rust_files, 1);
         Ok(())
@@ -5764,8 +6219,9 @@ fn decorated() {
         let (file_count, lang_stats) = dir_stats
             .language_stats
             .get("Rust")
-            .expect("expected Rust entry for empty file");
-        assert_eq!(*file_count, 1);
+            .expect("expected Rust entry for empty file")
+            .summary();
+        assert_eq!(file_count, 1);
         assert_eq!(lang_stats.code_lines, 0);
         assert_eq!(lang_stats.comment_lines, 0);
         assert_eq!(lang_stats.blank_lines, 0);
@@ -5818,7 +6274,8 @@ fn decorated() {
         assert_eq!(error_count, 0);
         let mut aggregated = LanguageStats::default();
         for dir_stats in stats.values() {
-            for (_, lang_stats) in dir_stats.language_stats.values() {
+            for entry in dir_stats.language_stats.values() {
+                let (_, lang_stats) = entry.summary();
                 aggregated.code_lines += lang_stats.code_lines;
                 aggregated.comment_lines += lang_stats.comment_lines;
                 aggregated.blank_lines += lang_stats.blank_lines;
@@ -6471,8 +6928,8 @@ fn decorated() {
         // Ensure only one Rust file counted
         let mut rust_files = 0u64;
         for dir in stats.values() {
-            if let Some((n, _)) = dir.language_stats.get("Rust") {
-                rust_files += *n;
+            if let Some(entry) = dir.language_stats.get("Rust") {
+                rust_files += entry.total_files();
             }
         }
         assert_eq!(rust_files, 1);

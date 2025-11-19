@@ -61,6 +61,7 @@ mdkloc [PATH]
 - `-d, --max-depth <N>`: Limit recursion depth (default: 100)
 - `-n, --non-recursive`: Only analyze the top-level directory
 - `-f, --filespec <GLOB>`: Only include files matching the glob in each directory
+- `-r, --role-breakdown`: Include per-role (mainline vs. test) tables in the report
 
 ### Examples
 
@@ -207,3 +208,31 @@ Licensed under the terms in LICENSE.
 Notes
 - Some legacy/templating languages are handled with practical heuristics (e.g., Algol COMMENT...; COBOL column 7; Fortran fixed/free forms). If you have dialect-specific files, open an issue with examples and we can refine the counters.
 - To compare with tokei, use the Code column in both tools and ensure you scan the same directory set and language filters.
+4. **Optional Role Breakdown** (when `--role-breakdown` is set):
+   ```
+   Role breakdown (Mainline)
+   --------------------------------------------------------------------------------
+   Directory                                 Language     Files      Code  Comments     Blank
+   --------------------------------------------------------------------------------
+   ./src                                    Rust             1         3          1          0
+   --------------------------------------------------------------------------------
+   Totals by language (Mainline):
+                                            Rust             1         3          1          0
+
+   Role breakdown (Test)
+   --------------------------------------------------------------------------------
+   Directory                                 Language     Files      Code  Comments     Blank
+   --------------------------------------------------------------------------------
+   ./src                                    Rust             1         4          1          0
+   ./tests                                  Rust             1         2          0          0
+   --------------------------------------------------------------------------------
+   Totals by language (Test):
+                                            Rust             2         6          1          0
+   ```
+   This makes it easy to understand how much of a language's footprint comes from production code versus test suites (currently implemented for Rust, with room to expand to other languages).
+
+### Role Breakdown Roadmap
+
+- Add file-level heuristics for Go (`*_test.go`), Python (`test_*.py`, `tests/` packages), and JS/TS (`*.spec.ts`, `__tests__/`) so they automatically route to the Test role.
+- Explore doc-test detection (Rust `/// ````, Python doctest fences) to decide whether they should count toward tests, comments, or code.
+- Provide machine-readable (JSON) output for role data once non-interactive consumers need it.

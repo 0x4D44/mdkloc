@@ -38,6 +38,8 @@ const FILE_TYPE_FAIL_TAG: &str = "__mdkloc_file_type_fail__.rs";
 const FAULT_ENV_VAR: &str = "MDKLOC_ENABLE_FAULTS";
 
 // Performance metrics structure
+const CODE_ROLE_COUNT: usize = 2;
+
 struct PerformanceMetrics {
     files_processed: Arc<AtomicU64>,
     lines_processed: Arc<AtomicU64>,
@@ -45,6 +47,8 @@ struct PerformanceMetrics {
     last_update: Instant,
     writer: Box<dyn Write + Send>,
     progress_enabled: bool,
+    role_files: [AtomicU64; CODE_ROLE_COUNT],
+    role_lines: [AtomicU64; CODE_ROLE_COUNT],
 }
 
 #[derive(Parser, Debug)]
@@ -76,6 +80,9 @@ struct Args {
 
     #[arg(short = 'f', long)]
     filespec: Option<String>,
+
+    #[arg(short = 'r', long)]
+    role_breakdown: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -86,9 +93,401 @@ struct LanguageStats {
     overlap_lines: u64,
 }
 
+impl LanguageStats {
+    fn add_assign(&mut self, other: &LanguageStats) {
+        self.code_lines += other.code_lines;
+        self.comment_lines += other.comment_lines;
+        self.blank_lines += other.blank_lines;
+        self.overlap_lines += other.overlap_lines;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileRoleHint {
+    Unknown,
+    TestFile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CodeRole {
+    Mainline = 0,
+    Test = 1,
+}
+
+impl CodeRole {
+    const ALL: [CodeRole; CODE_ROLE_COUNT] = [CodeRole::Mainline, CodeRole::Test];
+
+    fn as_index(self) -> usize {
+        self as usize
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            CodeRole::Mainline => "Mainline",
+            CodeRole::Test => "Test",
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct RoleBucket {
+    stats: LanguageStats,
+    total_lines: u64,
+}
+
+#[derive(Debug, Clone)]
+struct RoleSplit {
+    buckets: [Option<RoleBucket>; CODE_ROLE_COUNT],
+    total_lines: u64,
+}
+
+impl Default for RoleSplit {
+    fn default() -> Self {
+        Self {
+            buckets: [None; CODE_ROLE_COUNT],
+            total_lines: 0,
+        }
+    }
+}
+
+impl RoleSplit {
+    fn single(role: CodeRole, stats: LanguageStats, total_lines: u64) -> Self {
+        let mut split = RoleSplit::default();
+        split.push(role, stats, total_lines);
+        split
+    }
+
+    fn push(&mut self, role: CodeRole, stats: LanguageStats, total_lines: u64) {
+        self.buckets[role.as_index()] = Some(RoleBucket { stats, total_lines });
+        self.total_lines += total_lines;
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (CodeRole, RoleBucket)> + '_ {
+        CodeRole::ALL
+            .iter()
+            .copied()
+            .filter_map(|role| self.buckets[role.as_index()].map(|bucket| (role, bucket)))
+    }
+
+    #[cfg(test)]
+    fn bucket(&self, role: CodeRole) -> Option<RoleBucket> {
+        self.buckets[role.as_index()]
+    }
+
+    fn total_lines(&self) -> u64 {
+        self.total_lines
+    }
+
+    fn role_count(&self) -> usize {
+        CodeRole::ALL
+            .iter()
+            .filter(|role| self.buckets[role.as_index()].is_some())
+            .count()
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct RoleStats {
+    files: u64,
+    totals: LanguageStats,
+}
+
+impl RoleStats {
+    fn add_file(&mut self, stats: &LanguageStats) {
+        self.files += 1;
+        self.totals.add_assign(stats);
+    }
+
+    #[cfg(test)]
+    fn add_aggregate(&mut self, files: u64, stats: &LanguageStats) {
+        self.files += files;
+        self.totals.add_assign(stats);
+    }
+
+    fn merge(&mut self, other: &RoleStats) {
+        self.files += other.files;
+        self.totals.add_assign(&other.totals);
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct LanguageEntry {
+    per_role: [RoleStats; CODE_ROLE_COUNT],
+    total_files: u64,
+}
+
+impl LanguageEntry {
+    fn record_roles(&mut self, role_stats: &[(CodeRole, LanguageStats)]) {
+        if role_stats.is_empty() {
+            return;
+        }
+        self.total_files += 1;
+        for (role, stats) in role_stats {
+            self.per_role[role.as_index()].add_file(stats);
+        }
+    }
+
+    #[cfg(test)]
+    fn record_aggregate(&mut self, role: CodeRole, files: u64, stats: LanguageStats) {
+        self.total_files += files;
+        self.per_role[role.as_index()].add_aggregate(files, &stats);
+    }
+
+    fn absorb(&mut self, other: LanguageEntry) {
+        self.total_files += other.total_files;
+        for role in CodeRole::ALL {
+            self.per_role[role.as_index()].merge(&other.per_role[role.as_index()]);
+        }
+    }
+
+    fn total_files(&self) -> u64 {
+        self.total_files
+    }
+
+    fn total_stats(&self) -> LanguageStats {
+        let mut totals = LanguageStats::default();
+        for role in &self.per_role {
+            totals.add_assign(&role.totals);
+        }
+        totals
+    }
+
+    fn summary(&self) -> (u64, LanguageStats) {
+        (self.total_files(), self.total_stats())
+    }
+
+    fn role_summary(&self, role: CodeRole) -> Option<(u64, LanguageStats)> {
+        let role_stats = &self.per_role[role.as_index()];
+        if role_stats.files == 0 {
+            None
+        } else {
+            Some((role_stats.files, role_stats.totals))
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct DirectoryStats {
-    language_stats: HashMap<String, (u64, LanguageStats)>, // (file_count, stats) per language
+    language_stats: HashMap<String, LanguageEntry>,
+}
+
+fn infer_role_from_path(root_path: &Path, file_path: &Path) -> FileRoleHint {
+    // Prefer path-based hints first (e.g., files under tests/ directories)
+    if let Ok(relative) = file_path.strip_prefix(root_path) {
+        for component in relative.components() {
+            if let std::path::Component::Normal(name) = component {
+                if name.eq_ignore_ascii_case("tests")
+                    || name.eq_ignore_ascii_case("__tests__")
+                    || name.eq_ignore_ascii_case("testdata")
+                {
+                    return FileRoleHint::TestFile;
+                }
+            }
+        }
+    }
+
+    if let Some(file_name) = file_path.file_name().and_then(|n| n.to_str()) {
+        let lower = file_name.to_lowercase();
+        if lower.starts_with("test_")
+            || lower.ends_with("_test.rs")
+            || lower.ends_with("_test.py")
+            || lower.ends_with("_test.go")
+            || lower.ends_with("_test.ts")
+            || lower.contains(".test.")
+            || lower.contains(".spec.")
+        {
+            return FileRoleHint::TestFile;
+        }
+    }
+
+    FileRoleHint::Unknown
+}
+
+#[derive(Clone, Copy)]
+enum StringMode {
+    Normal(char),
+    Raw(usize),
+}
+
+#[derive(Default)]
+struct BraceScanState {
+    in_block_comment: bool,
+    string_mode: Option<StringMode>,
+}
+
+impl BraceScanState {
+    fn scan_line(&mut self, line: &str, tracker: &mut RustRoleTracker) {
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            if self.in_block_comment {
+                if c == '*' && matches!(chars.peek(), Some('/')) {
+                    self.in_block_comment = false;
+                    chars.next();
+                }
+                continue;
+            }
+            if let Some(mode) = &mut self.string_mode {
+                match mode {
+                    StringMode::Normal(delim) => {
+                        if c == '\\' {
+                            chars.next();
+                            continue;
+                        }
+                        if c == *delim {
+                            self.string_mode = None;
+                        }
+                    }
+                    StringMode::Raw(hashes) => {
+                        if c == '"' {
+                            let mut remaining = *hashes;
+                            let mut matched = true;
+                            while remaining > 0 {
+                                if matches!(chars.peek(), Some('#')) {
+                                    chars.next();
+                                    remaining -= 1;
+                                } else {
+                                    matched = false;
+                                    break;
+                                }
+                            }
+                            if matched {
+                                self.string_mode = None;
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            match c {
+                '/' => {
+                    if matches!(chars.peek(), Some('/')) {
+                        break;
+                    } else if matches!(chars.peek(), Some('*')) {
+                        self.in_block_comment = true;
+                        chars.next();
+                    }
+                }
+                '"' => {
+                    self.string_mode = Some(StringMode::Normal('"'));
+                }
+                '\'' => {
+                    self.string_mode = Some(StringMode::Normal('\''));
+                }
+                'r' => {
+                    let mut clone = chars.clone();
+                    let mut hashes = 0usize;
+                    while matches!(clone.peek(), Some('#')) {
+                        hashes += 1;
+                        clone.next();
+                    }
+                    if matches!(clone.peek(), Some('"')) {
+                        for _ in 0..hashes {
+                            chars.next();
+                        }
+                        if matches!(chars.peek(), Some('"')) {
+                            chars.next();
+                        }
+                        self.string_mode = Some(StringMode::Raw(hashes));
+                    }
+                }
+                '{' => tracker.open_scope(),
+                '}' => tracker.close_scope(),
+                _ => {}
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct RustRoleTracker {
+    scope_stack: Vec<CodeRole>,
+    pending_scope_role: Option<CodeRole>,
+    pending_line_role: Option<CodeRole>,
+}
+
+impl RustRoleTracker {
+    fn new(hint: FileRoleHint) -> Self {
+        let base_role = if matches!(hint, FileRoleHint::TestFile) {
+            CodeRole::Test
+        } else {
+            CodeRole::Mainline
+        };
+        Self {
+            scope_stack: vec![base_role],
+            pending_scope_role: None,
+            pending_line_role: None,
+        }
+    }
+
+    fn current_role(&self) -> CodeRole {
+        *self.scope_stack.last().unwrap()
+    }
+
+    fn mark_pending_test(&mut self) {
+        let role = CodeRole::Test;
+        self.pending_scope_role = Some(role);
+        self.pending_line_role = Some(role);
+    }
+
+    fn take_line_role(&mut self) -> Option<CodeRole> {
+        self.pending_line_role.take()
+    }
+
+    fn clear_pending_scope(&mut self) {
+        self.pending_scope_role = None;
+    }
+
+    fn open_scope(&mut self) {
+        let role = self
+            .pending_scope_role
+            .take()
+            .unwrap_or_else(|| self.current_role());
+        self.scope_stack.push(role);
+    }
+
+    fn close_scope(&mut self) {
+        if self.scope_stack.len() > 1 {
+            self.scope_stack.pop();
+        }
+    }
+}
+
+fn attribute_indicates_test(attr: &str) -> bool {
+    let lower = attr.trim().to_ascii_lowercase();
+    if lower.starts_with("#[cfg(") {
+        if lower.contains("not(test") {
+            return false;
+        }
+        return lower.contains("test");
+    }
+    lower.starts_with("#[test") || lower.contains("::test]")
+}
+
+fn detect_rust_line_roles(lines: &[String], hint: FileRoleHint) -> Vec<CodeRole> {
+    let mut tracker = RustRoleTracker::new(hint);
+    let mut brace_state = BraceScanState::default();
+    let mut roles = Vec::with_capacity(lines.len());
+    for line in lines {
+        let trimmed = line.trim();
+        let mut role = if trimmed.is_empty() {
+            tracker.current_role()
+        } else {
+            tracker
+                .take_line_role()
+                .unwrap_or_else(|| tracker.current_role())
+        };
+        if trimmed.starts_with("#[") && attribute_indicates_test(trimmed) {
+            tracker.mark_pending_test();
+            role = CodeRole::Test;
+        }
+        roles.push(role);
+        if tracker.pending_scope_role.is_some() && trimmed.ends_with(';') && !trimmed.contains('{')
+        {
+            tracker.clear_pending_scope();
+        }
+        brace_state.scan_line(line, &mut tracker);
+    }
+    roles
 }
 
 // Internal processing context to shorten repetitive call sites in scanning.
@@ -168,20 +567,19 @@ fn merge_directory_stats(
     dir: PathBuf,
     stat: DirectoryStats,
 ) {
-    if let Some(existing) = target.get_mut(&dir) {
-        for (lang, (count, lang_stats)) in stat.language_stats {
-            let (existing_count, existing_stats) = existing
-                .language_stats
-                .entry(lang)
-                .or_insert((0, LanguageStats::default()));
-            *existing_count += count;
-            existing_stats.code_lines += lang_stats.code_lines;
-            existing_stats.comment_lines += lang_stats.comment_lines;
-            existing_stats.blank_lines += lang_stats.blank_lines;
-            existing_stats.overlap_lines += lang_stats.overlap_lines;
+    match target.get_mut(&dir) {
+        Some(existing) => {
+            for (lang, entry) in stat.language_stats {
+                existing
+                    .language_stats
+                    .entry(lang)
+                    .or_default()
+                    .absorb(entry);
+            }
         }
-    } else {
-        target.insert(dir, stat);
+        None => {
+            target.insert(dir, stat);
+        }
     }
 }
 
@@ -212,6 +610,8 @@ impl PerformanceMetrics {
             last_update: Instant::now(),
             writer,
             progress_enabled,
+            role_files: std::array::from_fn(|_| AtomicU64::new(0)),
+            role_lines: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 
@@ -273,6 +673,29 @@ impl PerformanceMetrics {
             format!("{:.1} lines/sec", safe_rate(lines, elapsed)).bright_yellow()
         );
     }
+
+    fn record_role(&self, role: CodeRole, lines: u64) {
+        self.role_files[role.as_index()].fetch_add(1, Ordering::Relaxed);
+        self.role_lines[role.as_index()].fetch_add(lines, Ordering::Relaxed);
+    }
+
+    fn role_counters(&self) -> [(u64, u64); CODE_ROLE_COUNT] {
+        std::array::from_fn(|idx| {
+            (
+                self.role_files[idx].load(Ordering::Relaxed),
+                self.role_lines[idx].load(Ordering::Relaxed),
+            )
+        })
+    }
+
+    fn has_role_data(&self) -> bool {
+        self.role_files
+            .iter()
+            .zip(&self.role_lines)
+            .any(|(files, lines)| {
+                files.load(Ordering::Relaxed) > 0 || lines.load(Ordering::Relaxed) > 0
+            })
+    }
 }
 
 /// Reads a file’s entire content as lines, converting invalid UTF‑8 sequences using replacement characters.
@@ -320,6 +743,10 @@ impl Iterator for LossyLineReader {
 fn read_file_lines_lossy(file_path: &Path) -> io::Result<LossyLineReader> {
     let file = fs::File::open(file_path)?;
     Ok(LossyLineReader::new(file))
+}
+
+fn read_file_lines_vec(file_path: &Path) -> io::Result<Vec<String>> {
+    read_file_lines_lossy(file_path)?.collect()
 }
 
 /// Identify the language based on filename and/or extension (case-insensitive).
@@ -626,6 +1053,20 @@ fn count_lines_with_stats(file_path: &Path) -> io::Result<(LanguageStats, u64)> 
     }
 }
 
+fn count_lines_with_roles(file_path: &Path, role_hint: FileRoleHint) -> io::Result<RoleSplit> {
+    let extension = file_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if extension == "rs" {
+        return count_rust_lines_role_aware(file_path, role_hint);
+    }
+    // TODO: Extend with Go/Python/JS-specific role splits once heuristics mature.
+    let (stats, total_lines) = count_lines_with_stats(file_path)?;
+    Ok(RoleSplit::single(CodeRole::Mainline, stats, total_lines))
+}
+
 fn count_generic_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
     let mut stats = LanguageStats::default();
     let mut total_lines = 0;
@@ -691,6 +1132,75 @@ fn count_rust_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
         stats.code_lines += 1;
     }
     Ok((stats, total_lines))
+}
+
+fn count_rust_lines_role_aware(file_path: &Path, hint: FileRoleHint) -> io::Result<RoleSplit> {
+    let lines = read_file_lines_vec(file_path)?;
+    if lines.is_empty() {
+        let default_role = if matches!(hint, FileRoleHint::TestFile) {
+            CodeRole::Test
+        } else {
+            CodeRole::Mainline
+        };
+        return Ok(RoleSplit::single(default_role, LanguageStats::default(), 0));
+    }
+    let roles = detect_rust_line_roles(&lines, hint);
+    let mut stats_per_role = [LanguageStats::default(); CODE_ROLE_COUNT];
+    let mut in_block_comment = false;
+    for (line, &role) in lines.iter().zip(roles.iter()) {
+        let trimmed = line.trim();
+        let bucket = &mut stats_per_role[role.as_index()];
+        if trimmed.is_empty() {
+            bucket.blank_lines += 1;
+            continue;
+        }
+        if in_block_comment {
+            bucket.comment_lines += 1;
+            if let Some(end) = trimmed.find("*/") {
+                in_block_comment = false;
+                let rest = trimmed[end + 2..].trim();
+                if rest.is_empty() {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+        }
+        if trimmed.starts_with("#[") {
+            bucket.code_lines += 1;
+            continue;
+        }
+        if let Some(pos) = trimmed.find("/*") {
+            bucket.comment_lines += 1;
+            let before = &trimmed[..pos];
+            if !before.trim().is_empty() {
+                bucket.code_lines += 1;
+            }
+            if !trimmed.contains("*/") {
+                in_block_comment = true;
+            } else {
+                let after_comment = trimmed.split("*/").nth(1).unwrap_or("");
+                if !after_comment.trim().is_empty() && !after_comment.trim().starts_with("//") {
+                    bucket.code_lines += 1;
+                }
+            }
+            continue;
+        }
+        if trimmed.starts_with("///") || trimmed.starts_with("//!") || trimmed.starts_with("//") {
+            bucket.comment_lines += 1;
+            continue;
+        }
+        bucket.code_lines += 1;
+    }
+    let mut split = RoleSplit::default();
+    for role in CodeRole::ALL {
+        let stats = stats_per_role[role.as_index()];
+        if stats.code_lines + stats.comment_lines + stats.blank_lines > 0 {
+            let role_total = stats.code_lines + stats.comment_lines + stats.blank_lines;
+            split.push(role, stats, role_total);
+        }
+    }
+    Ok(split)
 }
 
 fn count_python_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
@@ -2033,36 +2543,50 @@ fn process_file(
         return Ok(());
     };
 
-    match count_lines_with_stats(file_path) {
-        Ok((raw_stats, total_lines)) => {
-            let file_stats = normalize_stats(raw_stats, total_lines);
-            metrics.update(total_lines);
-            let total_line_kinds =
-                file_stats.code_lines + file_stats.comment_lines + file_stats.blank_lines;
-            if total_line_kinds > 0 || total_lines == 0 {
-                let dir_path = file_path
-                    .parent()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_default();
-                let dir_stats = stats.entry(dir_path).or_default();
-                let (count, lang_stats) = dir_stats
+    let role_hint = infer_role_from_path(root_path, file_path);
+    match count_lines_with_roles(file_path, role_hint) {
+        Ok(role_split) => {
+            metrics.update(role_split.total_lines());
+            let dir_path = file_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_default();
+            let dir_stats = stats.entry(dir_path).or_default();
+            let show_role = role_split.role_count() > 1;
+            let mut pending: Vec<(CodeRole, LanguageStats)> = Vec::new();
+
+            for (role, bucket) in role_split.iter() {
+                let normalized_stats = normalize_stats(bucket.stats, bucket.total_lines);
+                let total_line_kinds = normalized_stats.code_lines
+                    + normalized_stats.comment_lines
+                    + normalized_stats.blank_lines;
+                if total_line_kinds > 0 || bucket.total_lines == 0 {
+                    metrics.record_role(role, bucket.total_lines);
+                    pending.push((role, normalized_stats));
+
+                    if args.verbose {
+                        println!("File: {}", file_path.display());
+                        if show_role {
+                            println!("  Role: {:?}", role);
+                        }
+                        println!("  Code lines: {}", normalized_stats.code_lines);
+                        println!("  Comment lines: {}", normalized_stats.comment_lines);
+                        println!("  Blank lines: {}", normalized_stats.blank_lines);
+                        println!(
+                            "  Mixed code/comment lines: {}",
+                            normalized_stats.overlap_lines
+                        );
+                        println!();
+                    }
+                }
+            }
+
+            if !pending.is_empty() {
+                let entry = dir_stats
                     .language_stats
                     .entry(language.to_string())
-                    .or_insert((0, LanguageStats::default()));
-                *count += 1;
-                lang_stats.code_lines += file_stats.code_lines;
-                lang_stats.comment_lines += file_stats.comment_lines;
-                lang_stats.blank_lines += file_stats.blank_lines;
-                lang_stats.overlap_lines += file_stats.overlap_lines;
-
-                if args.verbose {
-                    println!("File: {}", file_path.display());
-                    println!("  Code lines: {}", file_stats.code_lines);
-                    println!("  Comment lines: {}", file_stats.comment_lines);
-                    println!("  Blank lines: {}", file_stats.blank_lines);
-                    println!("  Mixed code/comment lines: {}", file_stats.overlap_lines);
-                    println!();
-                }
+                    .or_default();
+                entry.record_roles(&pending);
             }
         }
         Err(err) => {
@@ -2274,20 +2798,7 @@ fn format_language_stats_line(
     )
 }
 
-fn build_analysis_report(
-    current_dir: &Path,
-    stats: &HashMap<PathBuf, DirectoryStats>,
-    files_processed: u64,
-    lines_processed: u64,
-    error_count: usize,
-) -> String {
-    let mut output = String::new();
-    let mut sorted_stats: Vec<_> = stats.iter().collect();
-    sorted_stats.sort_by(|(a, _), (b, _)| a.to_string_lossy().cmp(&b.to_string_lossy()));
-
-    let mut total_by_language: HashMap<String, (u64, LanguageStats)> = HashMap::new();
-
-    let _ = writeln!(output, "\n\nDetailed source code analysis:");
+fn write_language_table_header(output: &mut String) {
     let _ = writeln!(output, "{}", "-".repeat(112));
     let _ = writeln!(
         output,
@@ -2302,23 +2813,39 @@ fn build_analysis_report(
         width = LANG_WIDTH
     );
     let _ = writeln!(output, "{}", "-".repeat(112));
+}
 
-    for (path, dir_stats) in sorted_stats {
+fn build_analysis_report(
+    current_dir: &Path,
+    stats: &HashMap<PathBuf, DirectoryStats>,
+    files_processed: u64,
+    lines_processed: u64,
+    error_count: usize,
+    role_breakdown: bool,
+) -> String {
+    let mut output = String::new();
+    let mut sorted_stats: Vec<_> = stats.iter().collect();
+    sorted_stats.sort_by(|(a, _), (b, _)| a.to_string_lossy().cmp(&b.to_string_lossy()));
+
+    let mut total_by_language: HashMap<String, (u64, LanguageStats)> = HashMap::new();
+
+    let _ = writeln!(output, "\n\nDetailed source code analysis:");
+    write_language_table_header(&mut output);
+
+    for (path, dir_stats) in &sorted_stats {
         let display_path = format_directory_display(path, current_dir);
         let mut languages: Vec<_> = dir_stats.language_stats.iter().collect();
         languages.sort_by(|(a, _), (b, _)| a.cmp(b));
 
-        for (lang, (file_count, lang_stats)) in languages {
-            let line = format_language_stats_line(&display_path, lang, *file_count, lang_stats);
+        for (lang, entry) in languages {
+            let (file_count, lang_stats) = entry.summary();
+            let line = format_language_stats_line(&display_path, lang, file_count, &lang_stats);
             let _ = writeln!(output, "{}", line);
             let (total_count, total_stats) = total_by_language
                 .entry(lang.to_string())
                 .or_insert((0, LanguageStats::default()));
             *total_count += file_count;
-            total_stats.code_lines += lang_stats.code_lines;
-            total_stats.comment_lines += lang_stats.comment_lines;
-            total_stats.blank_lines += lang_stats.blank_lines;
-            total_stats.overlap_lines += lang_stats.overlap_lines;
+            total_stats.add_assign(&lang_stats);
         }
     }
 
@@ -2339,6 +2866,10 @@ fn build_analysis_report(
         grand_total.comment_lines += stats.comment_lines;
         grand_total.blank_lines += stats.blank_lines;
         grand_total.overlap_lines += stats.overlap_lines;
+    }
+
+    if role_breakdown {
+        append_role_breakdown_sections(&mut output, current_dir, &sorted_stats);
     }
 
     if files_processed > 0 || lines_processed > 0 {
@@ -2405,6 +2936,61 @@ fn build_analysis_report(
     }
 
     output
+}
+
+fn append_role_breakdown_sections(
+    output: &mut String,
+    current_dir: &Path,
+    sorted_stats: &[(&PathBuf, &DirectoryStats)],
+) {
+    for role in CodeRole::ALL {
+        append_single_role_section(output, current_dir, sorted_stats, role);
+    }
+}
+
+fn append_single_role_section(
+    output: &mut String,
+    current_dir: &Path,
+    sorted_stats: &[(&PathBuf, &DirectoryStats)],
+    role: CodeRole,
+) {
+    let mut totals_by_language: HashMap<String, (u64, LanguageStats)> = HashMap::new();
+    let mut has_rows = false;
+    for (path, dir_stats) in sorted_stats {
+        let display_path = format_directory_display(path, current_dir);
+        let mut languages: Vec<_> = dir_stats.language_stats.iter().collect();
+        languages.sort_by(|(a, _), (b, _)| a.cmp(b));
+        for (lang, entry) in languages {
+            if let Some((file_count, lang_stats)) = entry.role_summary(role) {
+                if !has_rows {
+                    let _ = writeln!(output, "\nRole breakdown ({})", role.label());
+                    write_language_table_header(output);
+                    has_rows = true;
+                }
+                let line = format_language_stats_line(&display_path, lang, file_count, &lang_stats);
+                let _ = writeln!(output, "{}", line);
+                let (total_count, total_stats) = totals_by_language
+                    .entry(lang.to_string())
+                    .or_insert((0, LanguageStats::default()));
+                *total_count += file_count;
+                total_stats.add_assign(&lang_stats);
+            }
+        }
+    }
+
+    if has_rows {
+        let _ = writeln!(output, "{:-<112}", "");
+        let _ = writeln!(output, "Totals by language ({}):", role.label());
+        let mut sorted_totals: Vec<_> = totals_by_language.iter().collect();
+        sorted_totals.sort_by(|(a, _), (b, _)| a.cmp(b));
+        for (lang, (file_count, stats)) in sorted_totals {
+            let line = format_language_stats_line("", lang, *file_count, stats);
+            let _ = writeln!(output, "{}", line);
+        }
+    } else {
+        let _ = writeln!(output, "\nRole breakdown ({})", role.label());
+        let _ = writeln!(output, "No {} data collected.", role.label().to_lowercase());
+    }
 }
 
 fn main() -> io::Result<()> {
@@ -2492,8 +3078,22 @@ fn run_cli_with_metrics(args: Args, metrics: &mut PerformanceMetrics) -> io::Res
         files_processed,
         lines_processed,
         error_count,
+        args.role_breakdown,
     );
     print!("{}", report);
+
+    if (args.role_breakdown || args.verbose) && metrics.has_role_data() {
+        println!("\n{}", "Role Summary:".blue().bold());
+        for (idx, (files, lines)) in metrics.role_counters().iter().enumerate() {
+            let role = CodeRole::ALL[idx];
+            println!(
+                "{}: {} files, {} lines",
+                role.label().bright_cyan(),
+                files.to_string().bright_yellow(),
+                lines.to_string().bright_yellow()
+            );
+        }
+    }
 
     Ok(())
 }
