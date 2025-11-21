@@ -276,10 +276,11 @@ fn infer_role_from_path(root_path: &Path, file_path: &Path) -> FileRoleHint {
     if let Ok(relative) = file_path.strip_prefix(root_path) {
         for component in relative.components() {
             if let std::path::Component::Normal(name) = component {
-                if name.eq_ignore_ascii_case("tests")
-                    || name.eq_ignore_ascii_case("__tests__")
-                    || name.eq_ignore_ascii_case("testdata")
-                {
+                let is_tests_dir =
+                    name.eq_ignore_ascii_case("tests") || name.eq_ignore_ascii_case("__tests__");
+                let is_testdata_rust = name.eq_ignore_ascii_case("testdata")
+                    && file_path.extension().and_then(|e| e.to_str()) == Some("rs");
+                if is_tests_dir || is_testdata_rust {
                     return FileRoleHint::TestFile;
                 }
             }
@@ -2561,7 +2562,10 @@ fn process_file(
                     + normalized_stats.comment_lines
                     + normalized_stats.blank_lines;
                 if total_line_kinds > 0 || bucket.total_lines == 0 {
-                    metrics.record_role(role, bucket.total_lines);
+                    let normalized_total = normalized_stats.code_lines
+                        + normalized_stats.comment_lines
+                        + normalized_stats.blank_lines;
+                    metrics.record_role(role, normalized_total);
                     pending.push((role, normalized_stats));
 
                     if args.verbose {
@@ -3087,10 +3091,17 @@ fn run_cli_with_metrics(args: Args, metrics: &mut PerformanceMetrics) -> io::Res
         for (idx, (files, lines)) in metrics.role_counters().iter().enumerate() {
             let role = CodeRole::ALL[idx];
             println!(
-                "{}: {} files, {} lines",
+                "{}: {} file occurrences, {} lines",
                 role.label().bright_cyan(),
                 files.to_string().bright_yellow(),
                 lines.to_string().bright_yellow()
+            );
+        }
+        if files_processed < metrics.role_counters().iter().map(|(f, _)| f).sum::<u64>() {
+            println!(
+                "{}",
+                "(Note: files can appear in multiple roles; counts above are per-role occurrences.)"
+                    .bright_black()
             );
         }
     }
