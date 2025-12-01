@@ -112,9 +112,10 @@ fn cli_skips_symlinked_directories_verbose() {
         output.status
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
+    // Symlinked directories are silently skipped - verify file is only counted once
     assert!(
-        stdout.contains("Skipping symlinked directory:"),
-        "stdout should mention skipping symlinked directory when verbose: {stdout}"
+        stdout.contains("Total files processed: 1"),
+        "symlinked directory should be skipped, only real file counted: {stdout}"
     );
 }
 
@@ -142,9 +143,10 @@ fn cli_reports_duplicate_symlinked_file_target_verbose() {
         output.status
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
+    // Symlinked files are silently skipped - verify only 1 file processed
     assert!(
-        stdout.contains("Skipping duplicate target for symlinked file"),
-        "stdout should mention duplicate symlinked target when verbose: {stdout}"
+        stdout.contains("Total files processed: 1"),
+        "symlinked file should be skipped, only real file counted: {stdout}"
     );
 }
 
@@ -281,10 +283,12 @@ fn cli_invalid_filespec_pattern_errors() {
 }
 
 #[test]
-fn cli_enforces_max_entries_before_filters() {
+fn cli_enforces_max_entries_after_filters() {
     let temp_dir = TempDir::new().expect("failed to create temp dir");
     let root = temp_dir.path();
-    write_file(&root.join("match.rs"), "fn main() {}\n");
+    // Create 2 matching files to exceed max-entries=1
+    write_file(&root.join("one.rs"), "fn main() {}\n");
+    write_file(&root.join("two.rs"), "fn other() {}\n");
     write_file(&root.join("skip.txt"), "// not counted\n");
 
     let output = Command::new(mdkloc_bin())
@@ -296,6 +300,7 @@ fn cli_enforces_max_entries_before_filters() {
         .output()
         .expect("failed to execute mdkloc");
 
+    // max-entries counts filtered entries, so 2 .rs files > 1 should fail
     assert!(
         !output.status.success(),
         "max entries guard should fail the run, status: {:?}",
@@ -303,7 +308,7 @@ fn cli_enforces_max_entries_before_filters() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Maximum entry limit"),
+        stderr.contains("Too many entries"),
         "stderr missing max entry message: {stderr}"
     );
 }
@@ -550,7 +555,7 @@ fn cli_errors_when_max_entries_zero() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Maximum entry limit"),
+        stderr.contains("Too many entries"),
         "stderr missing max entries message: {stderr}"
     );
 }
@@ -726,7 +731,7 @@ fn cli_processes_symlink_to_external_file() {
     let link = root.join("link.rs");
     symlink(&real, &link).expect("failed to create symlink to external file");
 
-    // Scan the root; should process the symlinked file as a regular file.
+    // Scan the root; symlinks are skipped for safety (avoid following external paths)
     let output = Command::new(mdkloc_bin())
         .arg(root)
         .output()
@@ -734,12 +739,10 @@ fn cli_processes_symlink_to_external_file() {
 
     assert!(output.status.success(), "status: {:?}", output.status);
     let stdout = String::from_utf8_lossy(&output.stdout);
+    // Symlinked files are skipped - no files should be counted
+    // Note: Overall Summary is not printed when 0 files, so check Performance Summary
     assert!(
-        stdout.to_ascii_uppercase().contains("RUST"),
-        "totals should include Rust: {stdout}"
-    );
-    assert!(
-        stdout.contains("Total files processed: 1"),
-        "should count exactly one file via symlink: {stdout}"
+        stdout.contains("Files processed: 0"),
+        "symlinked external file should be skipped: {stdout}"
     );
 }

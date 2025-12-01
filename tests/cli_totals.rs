@@ -18,7 +18,7 @@ fn parse_totals(stdout: &str) -> HashMap<String, (u64, u64, u64, u64, u64)> {
     let mut out = HashMap::new();
     let mut iter = stdout.lines();
     // Seek to the totals section
-    while let Some(line) = iter.next() {
+    for line in iter.by_ref() {
         if line.contains("Totals by language:") {
             break;
         }

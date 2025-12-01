@@ -17,7 +17,7 @@ fn parse_totals(stdout: &str) -> HashMap<String, (u64, u64, u64, u64, u64)> {
     // Map: lang -> (files, code, comments, mixed, blank)
     let mut out = HashMap::new();
     let mut it = stdout.lines();
-    while let Some(line) = it.next() {
+    for line in it.by_ref() {
         if line.contains("Totals by language:") {
             break;
         }

@@ -15,7 +15,7 @@ fn write_file(path: &Path, contents: &str) {
 fn parse_totals(stdout: &str) -> HashMap<String, (u64, u64, u64, u64, u64)> {
     let mut out = HashMap::new();
     let mut it = stdout.lines();
-    while let Some(l) = it.next() {
+    for l in it.by_ref() {
         if l.contains("Totals by language:") {
             break;
         }
@@ -24,7 +24,7 @@ fn parse_totals(stdout: &str) -> HashMap<String, (u64, u64, u64, u64, u64)> {
         if l.trim().is_empty() || l.contains("Overall Summary:") {
             break;
         }
-        let cols: Vec<&str> = l.trim_start().split_whitespace().collect();
+        let cols: Vec<&str> = l.split_whitespace().collect();
         if cols.len() < 6 {
             continue;
         }
@@ -66,13 +66,13 @@ fn cli_totals_shell_dotfiles_and_special_names() {
     assert!(out.status.success());
     let totals = parse_totals(&String::from_utf8_lossy(&out.stdout));
     assert!(
-        totals.get("Shell").is_some(),
+        totals.contains_key("Shell"),
         "expected Shell totals for dotfiles"
     );
-    assert!(totals.get("Makefile").is_some(), "expected Makefile totals");
-    assert!(totals.get("CMake").is_some(), "expected CMake totals");
+    assert!(totals.contains_key("Makefile"), "expected Makefile totals");
+    assert!(totals.contains_key("CMake"), "expected CMake totals");
     assert!(
-        totals.get("Dockerfile").is_some(),
+        totals.contains_key("Dockerfile"),
         "expected Dockerfile totals"
     );
 }

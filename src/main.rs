@@ -76,6 +76,9 @@ struct Args {
 
     #[arg(short = 'f', long)]
     filespec: Option<String>,
+
+    #[arg(short = 'r', long)]
+    role_breakdown: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -2424,6 +2427,7 @@ mod tests {
             max_depth: 100,
             non_recursive: false,
             filespec: None,
+            role_breakdown: false,
         }
     }
 

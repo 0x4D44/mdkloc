@@ -15,7 +15,7 @@ fn write_file(path: &Path, contents: &str) {
 fn parse_totals(stdout: &str) -> HashMap<String, (u64, u64, u64, u64, u64)> {
     let mut out = HashMap::new();
     let mut it = stdout.lines();
-    while let Some(l) = it.next() {
+    for l in it.by_ref() {
         if l.contains("Totals by language:") {
             break;
         }
@@ -24,7 +24,7 @@ fn parse_totals(stdout: &str) -> HashMap<String, (u64, u64, u64, u64, u64)> {
         if l.trim().is_empty() || l.contains("Overall Summary:") {
             break;
         }
-        let cols: Vec<&str> = l.trim_start().split_whitespace().collect();
+        let cols: Vec<&str> = l.split_whitespace().collect();
         if cols.len() < 6 {
             continue;
         }
