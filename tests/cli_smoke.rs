@@ -308,7 +308,7 @@ fn cli_enforces_max_entries_after_filters() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Too many entries"),
+        stderr.contains("Maximum entry limit"),
         "stderr missing max entry message: {stderr}"
     );
 }
@@ -555,7 +555,7 @@ fn cli_errors_when_max_entries_zero() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Too many entries"),
+        stderr.contains("Maximum entry limit"),
         "stderr missing max entries message: {stderr}"
     );
 }
@@ -739,10 +739,9 @@ fn cli_processes_symlink_to_external_file() {
 
     assert!(output.status.success(), "status: {:?}", output.status);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // Symlinked files are skipped - no files should be counted
-    // Note: Overall Summary is not printed when 0 files, so check Performance Summary
+    // Symlinked files are followed and processed (only symlinked directories are skipped)
     assert!(
-        stdout.contains("Files processed: 0"),
-        "symlinked external file should be skipped: {stdout}"
+        stdout.contains("Files processed: 1"),
+        "symlinked external file should be processed: {stdout}"
     );
 }

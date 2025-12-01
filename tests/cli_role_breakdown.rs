@@ -40,7 +40,6 @@ fn parse_role_totals(stdout: &str, role: &str) -> HashMap<String, (u64, u64)> {
 }
 
 #[test]
-#[ignore = "role_breakdown output not yet implemented - flag is accepted but output logic pending"]
 fn cli_role_breakdown_reports_mainline_and_test() {
     let temp_dir = TempDir::new().expect("failed to create temp dir");
     let root = temp_dir.path();
