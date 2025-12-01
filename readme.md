@@ -1,9 +1,15 @@
-# mdkloc v2.0.0
+# mdkloc v2.3.0
 
 A fast, multi-language lines-of-code analyzer written in Rust. mdkloc reports per-language code, comment, and blank line counts by directory and totals. It aims to align with common tools (like tokei) while remaining simple and fast.
 
-## What's New in 2.0.0
+## What's New
 
+### v2.3.0
+- Code quality improvements and modernized Rust idioms
+- Enhanced test coverage (279 tests)
+- Improved clippy compliance
+
+### v2.0.0
 - Major language expansion: Scala, YAML, JSON, XML (incl. SVG/XSL), HTML, TOML, CMake, Dockerfile, Makefile, INI, HCL/Terraform, ReStructuredText, Velocity, Mustache, Protobuf, plus classic languages: Algol, COBOL, Fortran, x86 Assembly, DCL (OpenVMS), and IPLAN (PSS/E).
 - Special-filename detection: Dockerfile, Makefile, CMakeLists.txt.
 - CLI enhancements: `--max-depth`, `--non-recursive`, and `--filespec` filtering; colored output.
@@ -143,10 +149,9 @@ The following directories are automatically ignored:
 
 ## Performance Considerations
 
-- Uses efficient file reading with UTF-8 validation
-- Handles invalid UTF-8 sequences gracefully
-- Implements parallel processing for large codebases
-- Provides real-time progress updates
+- Uses efficient buffered file reading with UTF-8 validation
+- Handles invalid UTF-8 sequences gracefully (lossy conversion)
+- Provides real-time progress updates during scanning
 - Configurable limits to prevent resource exhaustion
 
 ## Contributing
@@ -208,6 +213,7 @@ Licensed under the terms in LICENSE.
 Notes
 - Some legacy/templating languages are handled with practical heuristics (e.g., Algol COMMENT...; COBOL column 7; Fortran fixed/free forms). If you have dialect-specific files, open an issue with examples and we can refine the counters.
 - To compare with tokei, use the Code column in both tools and ensure you scan the same directory set and language filters.
+
 4. **Optional Role Breakdown** (when `--role-breakdown` is set):
    ```
    Role breakdown (Mainline)
