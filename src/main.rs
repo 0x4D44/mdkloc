@@ -56,7 +56,7 @@ struct PerformanceMetrics {
     author,
     version,
     about = "Source code analyser for multiple programming languages",
-    long_about = "Supported languages: Rust, Go, Python, Java, C/C++, C#, JavaScript, TypeScript, PHP, Perl, Ruby, Shell, Pascal, Scala, YAML, XML, JSON, HTML, TOML, Makefile, Dockerfile, INI, HCL, CMake, PowerShell, Batch, TCL, ReStructuredText, Velocity, Mustache, Protobuf, SVG, XSL, Algol, COBOL, Fortran, Assembly, DCL, IPLAN.",
+    long_about = "Supported languages: Rust, Go, Python, Java, C/C++, C#, JavaScript, TypeScript, PHP, Perl, Ruby, Shell, Pascal, Scala, YAML, XML, JSON, HTML, TOML, Makefile, Dockerfile, INI, HCL, CMake, PowerShell, Batch, TCL, ReStructuredText, Velocity, Mustache, Protobuf, SVG, XSL, Algol, COBOL, Fortran, Assembly, DCL, IPLAN, mdhavers.",
     color = clap::ColorChoice::Always
 )]
 struct Args {
@@ -841,6 +841,8 @@ fn get_language_from_extension(file_name: &str) -> Option<&'static str> {
         "com" => Some("DCL"),
         // IPLAN (PSS/E)
         "ipl" => Some("IPLAN"),
+        // mdhavers (Scots programming language)
+        "braw" => Some("mdhavers"),
         _ => None,
     }
 }
@@ -1050,6 +1052,8 @@ fn count_lines_with_stats(file_path: &Path) -> io::Result<(LanguageStats, u64)> 
         "asm" | "s" => count_asm_lines(file_path),
         "com" => count_dcl_lines(file_path),
         "ipl" => count_iplan_lines(file_path),
+        // mdhavers uses # for comments (like Python/Shell)
+        "braw" => count_mdhavers_lines(file_path),
         _ => count_generic_lines(file_path),
     }
 }
@@ -1131,6 +1135,27 @@ fn count_rust_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
             continue;
         }
         stats.code_lines += 1;
+    }
+    Ok((stats, total_lines))
+}
+
+/// Count lines for mdhavers (.braw files) - a Scots programming language.
+/// mdhavers uses # for single-line comments (like Python/Shell).
+/// https://github.com/0x4d44/mdhavers
+fn count_mdhavers_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
+    let mut stats = LanguageStats::default();
+    let mut total_lines = 0;
+    for line_result in read_file_lines_lossy(file_path)? {
+        let line = line_result?;
+        total_lines += 1;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            stats.blank_lines += 1;
+        } else if trimmed.starts_with('#') {
+            stats.comment_lines += 1;
+        } else {
+            stats.code_lines += 1;
+        }
     }
     Ok((stats, total_lines))
 }
