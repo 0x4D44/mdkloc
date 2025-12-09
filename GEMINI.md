@@ -1,56 +1,46 @@
-# Project Overview
+# mdkloc Context for Gemini
 
-This project is a high-performance, multi-language source code analyzer written in Rust. It provides detailed statistics about code, comment, and blank line distribution across a codebase.
+## Project Overview
+`mdkloc` is a fast, multi-language lines-of-code (LOC) analyzer written in Rust. It counts code, comments, and blank lines across many programming languages (Rust, Python, C/C++, Java, Go, etc.) and markup formats. It aims to be a performant and simple alternative to tools like `tokei`.
 
-**Main Technologies:**
+## Architecture & Structure
+- **Type:** Rust CLI application.
+- **Entry Point:** `src/main.rs` (Monolithic structure containing logic and language parsers).
+- **Tests:**
+  - Unit tests: Located within `src/main.rs` (and `src/tests_included.rs` for test modules).
+  - Integration tests: Located in `tests/` (e.g., `tests/cli_smoke.rs`), exercising the compiled binary.
+- **Documentation:** `readme.md` (User guide), `docs/` (Project history and plans), `AGENTS.md` (Agent guidelines).
 
-*   **Language:** Rust
-*   **Libraries:**
-    *   `clap`: For command-line argument parsing.
-    *   `unicode-normalization`: For normalizing path strings.
+## Development Workflow
 
-**Architecture:**
+### Build & Run
+*   **Build Debug:** `cargo build`
+*   **Build Release:** `cargo build --release`
+*   **Run:** `cargo run -- [PATH] [FLAGS]`
+    *   Example: `cargo run -- . --verbose --non-recursive`
 
-The tool is a command-line application that recursively scans a directory, identifies files of supported languages based on their extensions, and analyzes each file to count lines of code, comments, and blank lines. It supports parallel processing and provides real-time progress updates.
+### Testing & Verification
+*   **Run All Tests:** `cargo test`
+*   **Run Specific Test:** `cargo test --test <test_name>` (e.g., `cargo test --test cli_smoke`)
+*   **Format Code:** `cargo fmt`
+*   **Lint:** `cargo clippy -- -D warnings`
+*   **Coverage:** `cargo llvm-cov --workspace --summary-only` (requires `cargo-llvm-cov`)
 
-# Building and Running
+## Conventions & Guidelines
 
-**Build:**
+### Coding Style
+*   **Edition:** Rust 2021.
+*   **Formatting:** Strictly adhere to `rustfmt`.
+*   **Naming:** `snake_case` for functions/vars, `CamelCase` for types, `SCREAMING_SNAKE_CASE` for constants.
+*   **Error Handling:** Use `Result<T, E>` with propagation (`?`). Avoid `unwrap()`/`expect()` in production code; reserved for tests.
 
-To build the project, use the following command:
+### Agent Instructions (from AGENTS.md)
+*   **Minimal Changes:** Make targeted edits; do not rename files or change public interfaces unnecessarily.
+*   **Dependencies:** Avoid adding new dependencies unless absolutely required.
+*   **Verification:** ALWAYS run `cargo fmt`, `cargo clippy -- -D warnings`, and `cargo test` before considering a task complete.
+*   **Safety:** Never introduce secrets, network calls, or license headers.
 
-```bash
-cargo build --release
-```
-
-**Run:**
-
-To run the application, use the following command:
-
-```bash
-./target/release/mdkloc [PATH] [OPTIONS]
-```
-
-**Command-line Options:**
-
-*   `[PATH]`: The directory to analyze (defaults to the current directory).
-*   `-i, --ignore <PATHS>`: Directories to ignore (can be specified multiple times).
-*   `-v, --verbose`: Enable verbose output with per-file statistics.
-*   `-m, --max-entries <NUMBER>`: Maximum number of entries to process (default: 1000000).
-*   `-d, --max-depth <NUMBER>`: Maximum directory depth to scan (default: 100).
-
-**Test:**
-
-To run the test suite, use the following command:
-
-```bash
-cargo test
-```
-
-# Development Conventions
-
-*   **Coding Style:** The code follows standard Rust conventions, with a focus on performance and safety.
-*   **Error Handling:** The application uses `io::Result` for error handling and provides informative error messages.
-*   **Testing:** The project includes a comprehensive test suite using `#[cfg(test)]` and the `tempfile` crate for creating temporary files and directories for testing purposes.
-*   **Modularity:** The code is organized into functions with specific responsibilities, such as parsing command-line arguments, scanning directories, and counting lines of code for different languages.
-*   **Clean Compilation:** All code must compile cleanly with no warnings.
+## Key Features
+*   **Role Breakdown:** Distinguishes between "Mainline" (production) and "Test" code.
+*   **Performance Metrics:** Tracks processing speed (files/lines per sec).
+*   **Language Support:** Extensive list including legacy languages (COBOL, Fortran) and modern config files (TOML, YAML, HCL).

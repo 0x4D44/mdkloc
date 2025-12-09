@@ -19,6 +19,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use colored::*;
+use terminal_size::{terminal_size, Width};
 use glob::Pattern;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -83,6 +84,9 @@ struct Args {
 
     #[arg(short = 'r', long)]
     role_breakdown: bool,
+
+    #[arg(short = 'l', long)]
+    languages: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -3066,7 +3070,88 @@ fn set_override_args(args: Vec<OsString>) {
     }
 }
 
+fn print_supported_languages() {
+    let languages = [
+        ("Algol", colored::Color::White),
+        ("Assembly", colored::Color::Cyan),
+        ("Batch", colored::Color::White),
+        ("C#", colored::Color::Magenta),
+        ("C/C++", colored::Color::Blue),
+        ("CMake", colored::Color::Green),
+        ("COBOL", colored::Color::Blue),
+        ("DCL", colored::Color::White),
+        ("Dockerfile", colored::Color::Cyan),
+        ("Fortran", colored::Color::Magenta),
+        ("Go", colored::Color::Cyan),
+        ("HCL", colored::Color::Magenta),
+        ("HTML", colored::Color::Red),
+        ("INI", colored::Color::White),
+        ("IPLAN", colored::Color::White),
+        ("JSON", colored::Color::Yellow),
+        ("JSX", colored::Color::Yellow),
+        ("Java", colored::Color::Red),
+        ("JavaScript", colored::Color::Yellow),
+        ("Makefile", colored::Color::Red),
+        ("Mustache", colored::Color::Red),
+        ("PHP", colored::Color::Magenta),
+        ("Pascal", colored::Color::Green),
+        ("Perl", colored::Color::Cyan),
+        ("PowerShell", colored::Color::Blue),
+        ("Protobuf", colored::Color::Magenta),
+        ("Python", colored::Color::Yellow),
+        ("ReStructuredText", colored::Color::Green),
+        ("Ruby", colored::Color::Red),
+        ("Rust", colored::Color::Red),
+        ("SVG", colored::Color::Yellow),
+        ("Scala", colored::Color::Red),
+        ("Shell", colored::Color::Green),
+        ("TCL", colored::Color::Magenta),
+        ("TOML", colored::Color::Yellow),
+        ("TSX", colored::Color::Blue),
+        ("TypeScript", colored::Color::Blue),
+        ("Velocity", colored::Color::Cyan),
+        ("XML", colored::Color::Yellow),
+        ("XSL", colored::Color::Yellow),
+        ("YAML", colored::Color::Green),
+        ("mdhavers", colored::Color::Red),
+    ];
+
+    println!("Supported languages:");
+
+    let term_width = if let Some((Width(w), _)) = terminal_size() {
+        w as usize
+    } else {
+        80
+    };
+
+    let mut current_line_len = 0;
+    let mut first = true;
+    for (lang, color) in languages {
+        let lang_display = lang.color(color);
+        if !first {
+            if current_line_len + 2 + lang.len() > term_width {
+                println!(",");
+                print!("{}", lang_display);
+                current_line_len = lang.len();
+            } else {
+                print!(", {}", lang_display);
+                current_line_len += 2 + lang.len();
+            }
+        } else {
+            print!("{}", lang_display);
+            current_line_len += lang.len();
+        }
+        first = false;
+    }
+    println!();
+}
+
 fn run_cli_with_metrics(args: Args, metrics: &mut PerformanceMetrics) -> io::Result<()> {
+    if args.languages {
+        print_supported_languages();
+        return Ok(());
+    }
+
     println!(
         "{} {}",
         env!("CARGO_PKG_NAME").bright_cyan().bold(),
