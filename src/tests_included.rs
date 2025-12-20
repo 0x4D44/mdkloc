@@ -173,7 +173,7 @@
                     }
                     1 => {
                         self.state = 2;
-                        Err(io::Error::new(io::ErrorKind::Other, "simulated failure"))
+                        Err(io::Error::other("simulated failure"))
                     }
                     _ => Ok(0),
                 }
@@ -1336,7 +1336,7 @@ mod tests {
 
         // Separate branch: file_type failure at root level.
         let _file_type_fail_root = root.join(super::FILE_TYPE_FAIL_TAG);
-        create_test_file(&root, super::FILE_TYPE_FAIL_TAG, "fn file_fail() {}\n")?;
+        create_test_file(root, super::FILE_TYPE_FAIL_TAG, "fn file_fail() {}\n")?;
 
         // Healthy sibling to ensure stats persist.
         let healthy = root.join("healthy");
@@ -4397,6 +4397,7 @@ fn decorated() {
 
     #[test]
     fn test_language_blank_line_tracking() -> io::Result<()> {
+        #[allow(clippy::type_complexity)]
         let cases: Vec<(
             &str,
             &str,
