@@ -45,6 +45,7 @@ jobs:
           tool: cargo-llvm-cov
 
       - name: Coverage (lines >= 98%, regions >= 95%, functions >= 96%)
+        shell: bash
         run: |
           cargo llvm-cov --summary-only \
             --ignore-filename-regex 'src/tests_included.rs$' \
