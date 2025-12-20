@@ -48,7 +48,7 @@ jobs:
         shell: bash
         run: |
           cargo llvm-cov --summary-only \
-            --ignore-filename-regex 'src/tests_included.rs$' \
+            --ignore-filename-regex 'tests_included\.rs$' \
             --fail-under-lines 98 \
             --fail-under-regions 95 \
             --fail-under-functions 96
