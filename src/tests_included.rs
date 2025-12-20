@@ -1513,6 +1513,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_scan_directory_visits_symlink_branch() -> io::Result<()> {
         use std::os::unix::fs::symlink;
