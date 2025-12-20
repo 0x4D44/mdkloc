@@ -19,11 +19,11 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use colored::*;
-use terminal_size::{terminal_size, Width};
 use glob::Pattern;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use terminal_size::{terminal_size, Width};
 
 #[cfg(test)]
 use std::sync::OnceLock;
