@@ -6964,3 +6964,34 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn test_mdhavers_line_counting() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "hello.braw",
+            "# This is a comment\nscreive(\"Hello\")\n\n# Another comment\nscreive(\"World\")\n",
+        )?;
+        let (stats, total) = count_mdhavers_lines(temp_dir.path().join("hello.braw").as_path())?;
+        assert_eq!(total, 5, "expected 5 total lines");
+        assert_eq!(stats.code_lines, 2, "expected 2 code lines");
+        assert_eq!(stats.comment_lines, 2, "expected 2 comment lines");
+        assert_eq!(stats.blank_lines, 1, "expected 1 blank line");
+        Ok(())
+    }
+
+    #[test]
+    fn test_infer_role_from_path_testdata_rust() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let testdata = temp_dir.path().join("testdata");
+        fs::create_dir(&testdata)?;
+        create_test_file(&testdata, "fixture.rs", "fn main() {}\n")?;
+        let file_path = testdata.join("fixture.rs");
+        let role = infer_role_from_path(temp_dir.path(), &file_path);
+        assert!(
+            matches!(role, FileRoleHint::TestFile),
+            "testdata/*.rs should be TestFile"
+        );
+        Ok(())
+    }
