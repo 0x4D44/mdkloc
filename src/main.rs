@@ -1713,7 +1713,7 @@ fn count_pascal_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
                 stats.code_lines += 1;
             }
 
-            brace_comment_level += 1;
+            brace_comment_level += trimmed.matches("{").count() as i32;
             brace_comment_level -= trimmed.matches("}").count() as i32;
 
             // If comment ends on same line
@@ -1737,7 +1737,7 @@ fn count_pascal_lines(file_path: &Path) -> io::Result<(LanguageStats, u64)> {
                 stats.code_lines += 1;
             }
 
-            parenthesis_comment_level += 1;
+            parenthesis_comment_level += trimmed.matches("(*").count() as i32;
             parenthesis_comment_level -= trimmed.matches("*)").count() as i32;
 
             // If comment ends on same line
