@@ -787,6 +787,7 @@ fn get_language_from_extension(file_name: &str) -> Option<&'static str> {
         // Core set
         "rs" => Some("Rust"),
         "go" => Some("Go"),
+        "dart" => Some("Dart"),
         "py" => Some("Python"),
         "java" => Some("Java"),
         "cpp" | "c" | "h" | "hpp" => Some("C/C++"),
@@ -1019,6 +1020,7 @@ fn count_lines_with_stats(file_path: &Path) -> io::Result<(LanguageStats, u64)> 
     match extension.as_str() {
         "rs" => count_rust_lines(file_path),
         "go" => count_c_style_lines(file_path),
+        "dart" => count_c_style_lines(file_path),
         "py" => count_python_lines(file_path),
         "java" | "c" | "cpp" | "h" | "hpp" | "cs" => count_c_style_lines(file_path),
         "js" | "ts" | "jsx" | "tsx" => count_javascript_lines(file_path),

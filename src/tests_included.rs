@@ -255,6 +255,21 @@
     }
 
     #[test]
+    fn test_count_lines_with_stats_dart() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "main.dart",
+            "void main() {\n  print('Hello'); // inline\n  /* block */\n}\n/// doc comment\n",
+        )?;
+        let (stats, total_lines) = count_lines_with_stats(&temp_dir.path().join("main.dart"))?;
+        assert_eq!(total_lines, 5);
+        assert_eq!(stats.code_lines, 3, "dart code stats: {:?}", stats);
+        assert_eq!(stats.comment_lines, 3, "dart comment stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
     fn test_count_lines_with_stats_hcl_ini_combo() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
