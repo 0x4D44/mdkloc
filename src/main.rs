@@ -668,13 +668,13 @@ impl PerformanceMetrics {
         let _ = writeln!(
             writer,
             "Files processed: {} ({})",
-            files.to_string().bright_yellow(),
+            format_number(files).bright_yellow(),
             format!("{:.1} files/sec", safe_rate(files, elapsed)).bright_yellow()
         );
         let _ = writeln!(
             writer,
             "Lines processed: {} ({})",
-            lines.to_string().bright_yellow(),
+            format_number(lines).bright_yellow(),
             format!("{:.1} lines/sec", safe_rate(lines, elapsed)).bright_yellow()
         );
     }
@@ -880,6 +880,26 @@ fn truncate_start(s: &str, max_len: usize) -> String {
         let truncated: String = s.chars().skip(skip_count).collect();
         format!("...{}", truncated)
     }
+}
+
+fn format_number(n: u64) -> String {
+    let s = n.to_string();
+    if s.len() < 4 {
+        return s;
+    }
+    let mut result = String::with_capacity(s.len() + s.len() / 3);
+    let offset = s.len() % 3;
+    if offset > 0 {
+        result.push_str(&s[..offset]);
+        result.push(',');
+    }
+    for (i, c) in s[offset..].chars().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    result
 }
 
 fn format_directory_display(path: &Path, current_dir: &Path) -> String {
@@ -2602,12 +2622,21 @@ fn process_file(
                         if show_role {
                             println!("  Role: {:?}", role);
                         }
-                        println!("  Code lines: {}", normalized_stats.code_lines);
-                        println!("  Comment lines: {}", normalized_stats.comment_lines);
-                        println!("  Blank lines: {}", normalized_stats.blank_lines);
+                        println!(
+                            "  Code lines: {}",
+                            format_number(normalized_stats.code_lines)
+                        );
+                        println!(
+                            "  Comment lines: {}",
+                            format_number(normalized_stats.comment_lines)
+                        );
+                        println!(
+                            "  Blank lines: {}",
+                            format_number(normalized_stats.blank_lines)
+                        );
                         println!(
                             "  Mixed code/comment lines: {}",
-                            normalized_stats.overlap_lines
+                            format_number(normalized_stats.overlap_lines)
                         );
                         println!();
                     }
@@ -2822,11 +2851,11 @@ fn format_language_stats_line(
         "{:<40} {:<width$} {:>8} {:>10} {:>10} {:>10} {:>10}",
         prefix,
         lang,
-        file_count,
-        stats.code_lines,
-        stats.comment_lines,
-        stats.overlap_lines,
-        stats.blank_lines,
+        format_number(file_count),
+        format_number(stats.code_lines),
+        format_number(stats.comment_lines),
+        format_number(stats.overlap_lines),
+        format_number(stats.blank_lines),
         width = LANG_WIDTH
     )
 }
@@ -2910,17 +2939,17 @@ fn build_analysis_report(
         let _ = writeln!(
             output,
             "Total files processed: {}",
-            files_processed.to_string().bright_yellow()
+            format_number(files_processed).bright_yellow()
         );
         let _ = writeln!(
             output,
             "Total lines processed: {}",
-            lines_processed.to_string().bright_yellow()
+            format_number(lines_processed).bright_yellow()
         );
         let _ = writeln!(
             output,
             "Code lines:     {} ({})",
-            grand_total.code_lines.to_string().bright_yellow(),
+            format_number(grand_total.code_lines).bright_yellow(),
             format!(
                 "{:.1}%",
                 safe_percentage(grand_total.code_lines, lines_processed)
@@ -2930,7 +2959,7 @@ fn build_analysis_report(
         let _ = writeln!(
             output,
             "Comment lines:  {} ({})",
-            grand_total.comment_lines.to_string().bright_yellow(),
+            format_number(grand_total.comment_lines).bright_yellow(),
             format!(
                 "{:.1}%",
                 safe_percentage(grand_total.comment_lines, lines_processed)
@@ -2940,7 +2969,7 @@ fn build_analysis_report(
         let _ = writeln!(
             output,
             "Mixed lines:    {} ({})",
-            grand_total.overlap_lines.to_string().bright_yellow(),
+            format_number(grand_total.overlap_lines).bright_yellow(),
             format!(
                 "{:.1}%",
                 safe_percentage(grand_total.overlap_lines, lines_processed)
@@ -2950,7 +2979,7 @@ fn build_analysis_report(
         let _ = writeln!(
             output,
             "Blank lines:    {} ({})",
-            grand_total.blank_lines.to_string().bright_yellow(),
+            format_number(grand_total.blank_lines).bright_yellow(),
             format!(
                 "{:.1}%",
                 safe_percentage(grand_total.blank_lines, lines_processed)
@@ -3203,8 +3232,8 @@ fn run_cli_with_metrics(args: Args, metrics: &mut PerformanceMetrics) -> io::Res
             println!(
                 "{}: {} file occurrences, {} lines",
                 role.label().bright_cyan(),
-                files.to_string().bright_yellow(),
-                lines.to_string().bright_yellow()
+                format_number(*files).bright_yellow(),
+                format_number(*lines).bright_yellow()
             );
         }
         if files_processed < metrics.role_counters().iter().map(|(f, _)| f).sum::<u64>() {
@@ -3222,4 +3251,17 @@ fn run_cli_with_metrics(args: Args, metrics: &mut PerformanceMetrics) -> io::Res
 #[cfg(test)]
 mod tests {
     include!("tests_included.rs");
+
+    #[test]
+    fn test_format_number() {
+        use super::format_number;
+        assert_eq!(format_number(0), "0");
+        assert_eq!(format_number(10), "10");
+        assert_eq!(format_number(100), "100");
+        assert_eq!(format_number(1000), "1,000");
+        assert_eq!(format_number(10000), "10,000");
+        assert_eq!(format_number(100000), "100,000");
+        assert_eq!(format_number(1000000), "1,000,000");
+        assert_eq!(format_number(123456789), "123,456,789");
+    }
 }
