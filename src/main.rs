@@ -888,6 +888,11 @@ fn format_number(n: u64) -> String {
     if s.len() < 4 {
         return s;
     }
+    // Use scientific notation for very large numbers to avoid breaking column layouts.
+    // 100,000,000 is 11 chars. Columns are 8-10 chars.
+    if n >= 100_000_000 {
+        return format!("{:.2e}", n as f64);
+    }
     let mut result = String::with_capacity(s.len() + s.len() / 3);
     let offset = s.len() % 3;
     if offset > 0 {
@@ -904,6 +909,9 @@ fn format_number(n: u64) -> String {
 }
 
 fn format_rate(rate: f64) -> String {
+    if rate >= 100_000_000.0 {
+        return format!("{:.2e}", rate);
+    }
     let s = format!("{:.1}", rate);
     if let Some((integer, decimal)) = s.split_once('.') {
         if integer.len() > 3 {
@@ -3280,7 +3288,6 @@ mod tests {
 
     #[test]
     fn test_format_number() {
-        use super::format_number;
         assert_eq!(format_number(0), "0");
         assert_eq!(format_number(10), "10");
         assert_eq!(format_number(100), "100");
@@ -3288,16 +3295,20 @@ mod tests {
         assert_eq!(format_number(10000), "10,000");
         assert_eq!(format_number(100000), "100,000");
         assert_eq!(format_number(1000000), "1,000,000");
-        assert_eq!(format_number(123456789), "123,456,789");
+        assert_eq!(format_number(99999999), "99,999,999");
+        assert_eq!(format_number(100000000), "1.00e8");
+        assert_eq!(format_number(123456789), "1.23e8");
     }
 
     #[test]
     fn test_format_rate() {
-        use super::format_rate;
         assert_eq!(format_rate(0.0), "0.0");
         assert_eq!(format_rate(123.456), "123.5");
         assert_eq!(format_rate(1234.56), "1,234.6");
         assert_eq!(format_rate(12345.67), "12,345.7");
         assert_eq!(format_rate(1234567.89), "1,234,567.9");
+        assert_eq!(format_rate(99999999.9), "99,999,999.9");
+        assert_eq!(format_rate(100000000.0), "1.00e8");
+        assert_eq!(format_rate(123456789.0), "1.23e8");
     }
 }
