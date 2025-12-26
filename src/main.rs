@@ -644,11 +644,11 @@ impl PerformanceMetrics {
         let writer = &mut self.writer;
         let _ = write!(
             writer,
-            "\rProcessed {} files ({:.1} files/sec) and {} lines ({:.1} lines/sec)...",
-            files,
-            files as f64 / elapsed,
-            lines,
-            lines as f64 / elapsed
+            "\rProcessed {} files ({} files/sec) and {} lines ({} lines/sec)...",
+            format_number(files),
+            format_rate(files as f64 / elapsed),
+            format_number(lines),
+            format_rate(lines as f64 / elapsed)
         );
         let _ = writer.flush();
     }
@@ -669,13 +669,13 @@ impl PerformanceMetrics {
             writer,
             "Files processed: {} ({})",
             format_number(files).bright_yellow(),
-            format!("{:.1} files/sec", safe_rate(files, elapsed)).bright_yellow()
+            format!("{} files/sec", format_rate(safe_rate(files, elapsed))).bright_yellow()
         );
         let _ = writeln!(
             writer,
             "Lines processed: {} ({})",
             format_number(lines).bright_yellow(),
-            format!("{:.1} lines/sec", safe_rate(lines, elapsed)).bright_yellow()
+            format!("{} lines/sec", format_rate(safe_rate(lines, elapsed))).bright_yellow()
         );
     }
 
@@ -900,6 +900,30 @@ fn format_number(n: u64) -> String {
         result.push(c);
     }
     result
+}
+
+fn format_rate(rate: f64) -> String {
+    let s = format!("{:.1}", rate);
+    if let Some((integer, decimal)) = s.split_once('.') {
+        if integer.len() > 3 {
+            let mut result = String::with_capacity(s.len() + s.len() / 3);
+            let offset = integer.len() % 3;
+            if offset > 0 {
+                result.push_str(&integer[..offset]);
+                result.push(',');
+            }
+            for (i, c) in integer[offset..].chars().enumerate() {
+                if i > 0 && i % 3 == 0 {
+                    result.push(',');
+                }
+                result.push(c);
+            }
+            result.push('.');
+            result.push_str(decimal);
+            return result;
+        }
+    }
+    s
 }
 
 fn format_directory_display(path: &Path, current_dir: &Path) -> String {
@@ -3263,5 +3287,15 @@ mod tests {
         assert_eq!(format_number(100000), "100,000");
         assert_eq!(format_number(1000000), "1,000,000");
         assert_eq!(format_number(123456789), "123,456,789");
+    }
+
+    #[test]
+    fn test_format_rate() {
+        use super::format_rate;
+        assert_eq!(format_rate(0.0), "0.0");
+        assert_eq!(format_rate(123.456), "123.5");
+        assert_eq!(format_rate(1234.56), "1,234.6");
+        assert_eq!(format_rate(12345.67), "12,345.7");
+        assert_eq!(format_rate(1234567.89), "1,234,567.9");
     }
 }
