@@ -255,6 +255,21 @@
     }
 
     #[test]
+    fn test_count_lines_with_stats_dart() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "main.dart",
+            "void main() {\n  print('Hello'); // inline\n  /* block */\n}\n/// doc comment\n",
+        )?;
+        let (stats, total_lines) = count_lines_with_stats(&temp_dir.path().join("main.dart"))?;
+        assert_eq!(total_lines, 5);
+        assert_eq!(stats.code_lines, 3, "dart code stats: {:?}", stats);
+        assert_eq!(stats.comment_lines, 3, "dart comment stats: {:?}", stats);
+        Ok(())
+    }
+
+    #[test]
     fn test_count_lines_with_stats_hcl_ini_combo() -> io::Result<()> {
         let temp_dir = TempDir::new()?;
         create_test_file(
@@ -6994,5 +7009,295 @@ mod tests {
             matches!(role, FileRoleHint::TestFile),
             "testdata/*.rs should be TestFile"
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_handle_symlink_dir() -> io::Result<()> {
+        use std::os::unix::fs::symlink;
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        let target_dir = root.join("target_dir");
+        fs::create_dir(&target_dir)?;
+        create_test_file(&target_dir, "file.rs", "fn main() {}\n")?;
+
+        let link = root.join("link_dir");
+        symlink(&target_dir, &link)?;
+
+        let mut args = test_args();
+        args.verbose = true;
+        let mut metrics = test_metrics();
+        let mut stats = HashMap::new();
+        let mut error_count = 0;
+        let mut visited_paths = HashSet::new();
+
+        let mut ctx = ProcCtx {
+            args: &args,
+            root_path: root,
+            metrics: &mut metrics,
+            stats: &mut stats,
+            error_count: &mut error_count,
+            filespec: None,
+            visited_real_paths: &mut visited_paths,
+        };
+
+        handle_symlink(&mut ctx, &link)?;
+        
+        assert!(stats.is_empty());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_handle_symlink_file() -> io::Result<()> {
+        use std::os::unix::fs::symlink;
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        let target_file = root.join("target.rs");
+        create_test_file(root, "target.rs", "fn main() {}\n")?;
+
+        let link = root.join("link.rs");
+        symlink(&target_file, &link)?;
+
+        let mut args = test_args();
+        let mut metrics = test_metrics();
+        let mut stats = HashMap::new();
+        let mut error_count = 0;
+        let mut visited_paths = HashSet::new();
+
+        let mut ctx = ProcCtx {
+            args: &args,
+            root_path: root,
+            metrics: &mut metrics,
+            stats: &mut stats,
+            error_count: &mut error_count,
+            filespec: None,
+            visited_real_paths: &mut visited_paths,
+        };
+
+        handle_symlink(&mut ctx, &link)?;
+
+        assert!(!stats.is_empty());
+        let dir_stats = stats.values().next().unwrap();
+        assert!(dir_stats.language_stats.contains_key("Rust"));
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_handle_symlink_windows_file() -> io::Result<()> {
+        use std::os::windows::fs::symlink_file;
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        let target_file = root.join("target.rs");
+        create_test_file(root, "target.rs", "fn main() {}\n")?;
+
+        let link = root.join("link.rs");
+        if let Err(e) = symlink_file(&target_file, &link) {
+            // ERROR_PRIVILEGE_NOT_HELD = 1314
+            if e.kind() == io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(1314) {
+                return Ok(());
+            }
+            return Err(e);
+        }
+
+        let args = test_args();
+        let mut metrics = test_metrics();
+        let mut stats = HashMap::new();
+        let mut error_count = 0;
+        let mut visited_paths = HashSet::new();
+
+        let mut ctx = ProcCtx {
+            args: &args,
+            root_path: root,
+            metrics: &mut metrics,
+            stats: &mut stats,
+            error_count: &mut error_count,
+            filespec: None,
+            visited_real_paths: &mut visited_paths,
+        };
+
+        handle_symlink(&mut ctx, &link)?;
+
+        assert!(!stats.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_rust_escaped_strings() {
+        let lines = vec![
+            "fn main() {".to_string(),
+            "    let s = \"escaped \\\" quote\";".to_string(),
+            "    let c = '\\'';".to_string(),
+            "}".to_string(),
+        ];
+        let roles = detect_rust_line_roles(&lines, FileRoleHint::Unknown);
+        // All should be Mainline
+        for role in roles {
+            assert_eq!(role, CodeRole::Mainline);
+        }
+    }
+
+    #[test]
+    fn test_rust_raw_string_edge_cases() {
+        let mut tracker = RustRoleTracker::new(FileRoleHint::Unknown);
+        let mut state = BraceScanState::default();
+        
+        // r#" "# 
+        state.scan_line("r#\" \"#", &mut tracker);
+        assert!(state.string_mode.is_none());
+
+        // r#" " (not closed)
+        state.scan_line("r#\"", &mut tracker);
+        assert!(state.string_mode.is_some());
+        
+        // " inside raw string (not hash)
+        state.scan_line(" \" a ", &mut tracker); 
+        assert!(state.string_mode.is_some());
+        
+        // "# to close
+        state.scan_line("\"#", &mut tracker);
+        assert!(state.string_mode.is_none());
+    }
+
+    #[test]
+    fn test_javascript_comment_transitions() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "complex.js",
+            "/* block */ var x = 1; /* block2 */\n<!-- jsx --> var y = 2;\n",
+        )?;
+        let (stats, _) = count_javascript_lines(temp_dir.path().join("complex.js").as_path())?;
+        assert_eq!(stats.code_lines, 2);
+        assert_eq!(stats.comment_lines, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_powershell_complex_comments() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        // Mixed inline
+        create_test_file(
+            temp_dir.path(),
+            "complex.ps1",
+            "Write-Host 'a' # c1\nWrite-Host 'b' <# c2 #>\n<# c3 #> Write-Host 'c'\n",
+        )?;
+        let (stats, _) = count_powershell_lines(temp_dir.path().join("complex.ps1").as_path())?;
+        assert_eq!(stats.code_lines, 3);
+        
+        // Multi-line block
+        create_test_file(
+            temp_dir.path(),
+            "multiline.ps1",
+            "Write-Host 'd'\n<#\nstart\n#>\n",
+        )?;
+        let (stats2, _) = count_powershell_lines(temp_dir.path().join("multiline.ps1").as_path())?;
+        assert_eq!(stats2.code_lines, 1);
+        assert!(stats2.comment_lines >= 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_pascal_nested_comment_balance() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        create_test_file(
+            temp_dir.path(),
+            "nested.pas",
+            "{ { nested } } code\n(* (* nested *) *) code\n",
+        )?;
+        let (stats, _) = count_pascal_lines(temp_dir.path().join("nested.pas").as_path())?;
+        assert_eq!(stats.code_lines, 2);
+        assert_eq!(stats.comment_lines, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_handle_symlink_logic_with_regular_files() -> io::Result<()> {
+        // handle_symlink calls fs::metadata which follows links. 
+        // For regular files/dirs, it returns their metadata. 
+        // We can test the logic branches (is_dir, is_file) without actual symlinks.
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        
+        // 1. Target is Directory
+        let target_dir = root.join("target_dir");
+        fs::create_dir(&target_dir)?;
+        // handle_symlink should print verbose message and skip
+        let mut args = test_args();
+        args.verbose = true;
+        let mut metrics = test_metrics();
+        let mut stats = HashMap::new();
+        let mut error_count = 0;
+        let mut visited_paths = HashSet::new();
+        
+        {
+            let mut ctx = ProcCtx {
+                args: &args,
+                root_path: root,
+                metrics: &mut metrics,
+                stats: &mut stats,
+                error_count: &mut error_count,
+                filespec: None,
+                visited_real_paths: &mut visited_paths,
+            };
+            
+            handle_symlink(&mut ctx, &target_dir)?;
+        } // ctx dropped here, releasing borrows
+        
+        assert!(stats.is_empty());
+        assert_eq!(error_count, 0);
+
+        // 2. Target is File
+        let target_file = root.join("target.rs");
+        create_test_file(root, "target.rs", "fn main() {}\n")?;
+        
+        {
+            let mut ctx = ProcCtx {
+                args: &args,
+                root_path: root,
+                metrics: &mut metrics,
+                stats: &mut stats,
+                error_count: &mut error_count,
+                filespec: None,
+                visited_real_paths: &mut visited_paths,
+            };
+            handle_symlink(&mut ctx, &target_file)?;
+        }
+        
+        assert!(!stats.is_empty());
+        let dir_stats = stats.values().next().unwrap();
+        assert!(dir_stats.language_stats.contains_key("Rust"));
+        
+        Ok(())
+    }
+
+    #[test]
+    fn test_handle_symlink_error_branch() -> io::Result<()> {
+        // Force fetch_metadata failure using the fail tag
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path();
+        let fail_path = root.join(METADATA_FAIL_TAG);
+        // We don't need to create it because fetch_metadata will fail due to name match simulation
+        
+        let args = test_args();
+        let mut metrics = test_metrics();
+        let mut stats = HashMap::new();
+        let mut error_count = 0;
+        let mut visited_paths = HashSet::new();
+        
+        let mut ctx = ProcCtx {
+            args: &args,
+            root_path: root,
+            metrics: &mut metrics,
+            stats: &mut stats,
+            error_count: &mut error_count,
+            filespec: None,
+            visited_real_paths: &mut visited_paths,
+        };
+        
+        handle_symlink(&mut ctx, &fail_path)?;
+        assert_eq!(error_count, 1);
         Ok(())
     }

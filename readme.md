@@ -1,8 +1,11 @@
-# mdkloc v2.3.0
+# mdkloc v2.5.0
 
 A fast, multi-language lines-of-code analyzer written in Rust. mdkloc reports per-language code, comment, and blank line counts by directory and totals. It aims to align with common tools (like tokei) while remaining simple and fast.
 
 ## What's New
+
+### v2.5.0
+- Added support for Dart/Flutter projects
 
 ### v2.3.0
 - Code quality improvements and modernized Rust idioms
@@ -18,7 +21,7 @@ A fast, multi-language lines-of-code analyzer written in Rust. mdkloc reports pe
 ## Features
 
 - **Multi-language support** (non-exhaustive):
-  - Core: Rust, Go, C/C++, Java, C#, Python, JavaScript/TypeScript (JSX/TSX), PHP, Perl, Ruby, Shell, Pascal
+  - Core: Rust, Go, Dart, C/C++, Java, C#, Python, JavaScript/TypeScript (JSX/TSX), PHP, Perl, Ruby, Shell, Pascal
   - Config/Markup: YAML, JSON, XML, HTML, TOML, INI, CMake, Makefile, Dockerfile, HCL/Terraform, ReStructuredText, Velocity, Mustache, Protobuf
   - Classic/Legacy: Algol, COBOL, Fortran, Assembly, DCL (OpenVMS), IPLAN (PSS/E)
 
@@ -118,6 +121,8 @@ The tool provides three levels of output:
 | Language    | Line Comments | Block Comments | Doc Comments | Special Features |
 |------------|---------------|----------------|--------------|------------------|
 | Rust       | //           | /* */         | /// //!      | Attribute lines count as code |
+| Go         | //           | /* */         | -            | - |
+| Dart       | //           | /* */         | ///          | - |
 | Python     | #            | ''' '''       | -            | Multi-line strings |
 | JavaScript | //           | /* */ <!--    | -            | JSX/HTML-style comments |
 | Ruby       | #            | =begin/=end   | -            | Shebang support |
