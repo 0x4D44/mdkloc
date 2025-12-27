@@ -897,17 +897,14 @@ mod tests {
         let mut metrics = PerformanceMetrics::with_writer(Box::new(writer), false);
         run_cli_with_metrics(args, &mut metrics)?;
         let output = CaptureWriter::into_string(buffer);
+        // When no files are found, just display a simple message (no performance summary)
         assert!(
-            output.contains("Performance Summary"),
-            "zero-file run should still display performance summary: {output}"
+            !output.contains("Performance Summary"),
+            "zero-file run should not display performance summary: {output}"
         );
         assert!(
-            output.contains("Files processed"),
-            "zero-file run should report file count: {output}"
-        );
-        assert!(
-            output.contains("Lines processed"),
-            "zero-file run should report line count: {output}"
+            !output.contains("Detailed source code analysis"),
+            "zero-file run should not display detailed analysis: {output}"
         );
         Ok(())
     }

@@ -3244,9 +3244,16 @@ fn run_cli_with_metrics(args: Args, metrics: &mut PerformanceMetrics) -> io::Res
         &mut entries_count,
         &mut error_count,
     )?;
-    metrics.print_final_stats();
     let files_processed = metrics.files_processed.load(Ordering::Relaxed);
     let lines_processed = metrics.lines_processed.load(Ordering::Relaxed);
+
+    // If no source files were found, print a simple message and exit
+    if files_processed == 0 {
+        println!("\n{}", "No source code files found.".bright_yellow());
+        return Ok(());
+    }
+
+    metrics.print_final_stats();
 
     // Print detailed analysis with fixed-width directory field.
     let report = build_analysis_report(
