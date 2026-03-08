@@ -1,7 +1,10 @@
 [package]
 name = "mdkloc"
-version = "2.6.1"
+version = "2.7.0"
 edition = "2021"
+description = "A multi-language source code line counter"
+authors = ["0x4D44 <martingdavidson@gmail.com>"]
+license = "GPL-3.0-only"
 
 [dependencies]
 clap = { version = "4.1", features = ["derive"] }
@@ -12,3 +15,12 @@ terminal_size = "0.4.3"
 
 [dev-dependencies]
 tempfile = "3.3"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"
+
+[package.metadata.wix]
+upgrade-guid = "7B3F8A1E-C5D2-4E9A-B6F0-8D2C1A5E7F3B"

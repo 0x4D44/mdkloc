@@ -1,0 +1,141 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      release_ref:
+        description: "Existing tag to rebuild and publish (for example: v2.6.1)"
+        required: false
+        default: ""
+      toolchain:
+        description: "Rust toolchain version"
+        required: false
+        default: stable
+
+permissions:
+  contents: write
+
+jobs:
+  resolve:
+    name: Resolve Release Ref
+    runs-on: ubuntu-latest
+    outputs:
+      release_ref: ${{ steps.resolve.outputs.release_ref }}
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+    steps:
+      - name: Resolve target ref
+        id: resolve
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            ref="${GITHUB_REF#refs/tags/}"
+            tag="$ref"
+          else
+            ref="${{ github.event.inputs.release_ref }}"
+            if [[ -z "$ref" ]]; then
+              echo "::error::workflow_dispatch requires release_ref to be set to an existing tag such as v2.6.1"
+              exit 1
+            fi
+            tag="${ref#refs/tags/}"
+          fi
+
+          if [[ ! "$tag" =~ ^v[0-9] ]]; then
+            echo "::error::Release ref must resolve to a semver-style tag like v2.6.1"
+            exit 1
+          fi
+
+          echo "release_ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (Windows)
+    needs: resolve
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.release_ref }}
+
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ github.event.inputs.toolchain || 'stable' }}
+          components: clippy, rustfmt
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --all-targets
+        env:
+          RUSTFLAGS: -D warnings
+
+      - name: Install WiX Toolset
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314.exe" -OutFile wix314.exe
+          Start-Process -Wait -FilePath .\wix314.exe -ArgumentList '/install','/quiet','/norestart'
+
+      - name: Install cargo-wix
+        run: cargo install cargo-wix --locked
+
+      - name: Build release (deny warnings)
+        run: cargo build --release
+        env:
+          RUSTFLAGS: -D warnings
+
+      - name: Build MSI installer
+        run: cargo wix -p mdkloc --no-build
+
+      - name: Package artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/release/mdkloc.exe dist/mdkloc.exe
+          Compress-Archive -Path dist/mdkloc.exe -DestinationPath "mdkloc-${{ needs.resolve.outputs.release_tag }}-windows-x86_64.zip"
+          Copy-Item target/wix/*.msi "mdkloc-${{ needs.resolve.outputs.release_tag }}-windows-x86_64.msi"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mdkloc-Windows
+          path: |
+            mdkloc-${{ needs.resolve.outputs.release_tag }}-windows-x86_64.zip
+            mdkloc-${{ needs.resolve.outputs.release_tag }}-windows-x86_64.msi
+
+  release:
+    name: Publish Release
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.resolve.outputs.release_tag }}
+          name: ${{ needs.resolve.outputs.release_tag }}
+          draft: false
+          generate_release_notes: true
+          files: |
+            artifacts/*.zip
+            artifacts/*.msi

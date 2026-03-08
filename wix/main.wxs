@@ -1,0 +1,109 @@
+<?xml version='1.0' encoding='windows-1252'?>
+<!--
+  Please do not remove these pre-processor If-Else blocks. These are used with
+  the `cargo wix` subcommand to automatically determine the installation
+  destination for 32-bit versus 64-bit installers. Removal of these lines will
+  cause installation errors.
+-->
+<?if $(sys.BUILDARCH) = x64 or $(sys.BUILDARCH) = arm64 ?>
+    <?define PlatformProgramFilesFolder = "ProgramFiles64Folder" ?>
+<?else ?>
+    <?define PlatformProgramFilesFolder = "ProgramFilesFolder" ?>
+<?endif ?>
+
+<Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
+
+    <!-- WARNING: Never change the UpgradeCode GUID - it links all versions for upgrade detection -->
+    <Product
+        Id='*'
+        Name='mdkloc'
+        UpgradeCode='7B3F8A1E-C5D2-4E9A-B6F0-8D2C1A5E7F3B'
+        Manufacturer='0x4D44'
+        Language='1033'
+        Codepage='1252'
+        Version='$(var.Version)'>
+
+        <Package Id='*'
+            Keywords='Installer'
+            Description='A multi-language source code line counter'
+            Manufacturer='0x4D44'
+            InstallerVersion='450'
+            Languages='1033'
+            Compressed='yes'
+            InstallScope='perMachine'
+            SummaryCodepage='1252'
+            />
+
+        <MajorUpgrade
+            Schedule='afterInstallInitialize'
+            DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.'/>
+
+        <Media Id='1' Cabinet='media1.cab' EmbedCab='yes'/>
+
+        <Directory Id='TARGETDIR' Name='SourceDir'>
+            <Directory Id='$(var.PlatformProgramFilesFolder)' Name='PFiles'>
+                <Directory Id='CompanyFolder' Name='0x4D44 Software'>
+                <Directory Id='APPLICATIONFOLDER' Name='mdkloc'>
+
+                    <Component Id='License' Guid='*'>
+                        <File Id='LicenseFile'
+                            DiskId='1'
+                            Name='LICENSE'
+                            Source='LICENSE'
+                            KeyPath='yes'/>
+                    </Component>
+
+                    <Component Id='binary0' Guid='*'>
+                        <File
+                            Id='exe0'
+                            Name='mdkloc.exe'
+                            DiskId='1'
+                            Source='$(var.CargoTargetBinDir)\mdkloc.exe'
+                            KeyPath='yes'/>
+                    </Component>
+
+                    <Component Id='PathEntry' Guid='*'>
+                        <Environment Id='PathEnvironmentVariable'
+                            Name='PATH'
+                            Value='[APPLICATIONFOLDER]'
+                            Part='last'
+                            Action='set'
+                            System='yes'
+                            Permanent='no'/>
+                        <RegistryValue Root='HKLM'
+                            Key='Software\mdkloc\Installer'
+                            Name='PathEntry'
+                            Type='integer' Value='1' KeyPath='yes'/>
+                    </Component>
+
+                </Directory>
+                </Directory>
+            </Directory>
+        </Directory>
+
+        <Feature
+            Id='Complete'
+            Title='mdkloc'
+            Description='Multi-language source code line counter'
+            Level='1'
+            ConfigurableDirectory='APPLICATIONFOLDER'
+            AllowAdvertise='no'
+            Absent='disallow'>
+            <ComponentRef Id='License'/>
+            <ComponentRef Id='binary0'/>
+            <ComponentRef Id='PathEntry'/>
+        </Feature>
+
+        <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize'/>
+
+        <Property Id='ARPHELPLINK' Value='https://github.com/0x4D44/mdkloc'/>
+
+        <UI>
+            <UIRef Id='WixUI_Minimal'/>
+        </UI>
+
+        <WixVariable Id='WixUILicenseRtf' Value='wix\License.rtf'/>
+
+    </Product>
+
+</Wix>
