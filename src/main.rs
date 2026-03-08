@@ -50,6 +50,7 @@ struct PerformanceMetrics {
     progress_enabled: bool,
     role_files: [AtomicU64; CODE_ROLE_COUNT],
     role_lines: [AtomicU64; CODE_ROLE_COUNT],
+    role_code_lines: [AtomicU64; CODE_ROLE_COUNT],
 }
 
 #[derive(Parser, Debug)]
@@ -617,6 +618,7 @@ impl PerformanceMetrics {
             progress_enabled,
             role_files: std::array::from_fn(|_| AtomicU64::new(0)),
             role_lines: std::array::from_fn(|_| AtomicU64::new(0)),
+            role_code_lines: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 
@@ -679,16 +681,18 @@ impl PerformanceMetrics {
         );
     }
 
-    fn record_role(&self, role: CodeRole, lines: u64) {
+    fn record_role(&self, role: CodeRole, lines: u64, code_lines: u64) {
         self.role_files[role.as_index()].fetch_add(1, Ordering::Relaxed);
         self.role_lines[role.as_index()].fetch_add(lines, Ordering::Relaxed);
+        self.role_code_lines[role.as_index()].fetch_add(code_lines, Ordering::Relaxed);
     }
 
-    fn role_counters(&self) -> [(u64, u64); CODE_ROLE_COUNT] {
+    fn role_counters(&self) -> [(u64, u64, u64); CODE_ROLE_COUNT] {
         std::array::from_fn(|idx| {
             (
                 self.role_files[idx].load(Ordering::Relaxed),
                 self.role_lines[idx].load(Ordering::Relaxed),
+                self.role_code_lines[idx].load(Ordering::Relaxed),
             )
         })
     }
@@ -1033,6 +1037,15 @@ fn safe_rate(value: u64, elapsed_secs: f64) -> f64 {
     } else {
         value as f64 / elapsed_secs
     }
+}
+
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
 }
 
 fn safe_percentage(numerator: u64, denominator: u64) -> f64 {
@@ -2648,7 +2661,7 @@ fn process_file(
                     let normalized_total = normalized_stats.code_lines
                         + normalized_stats.comment_lines
                         + normalized_stats.blank_lines;
-                    metrics.record_role(role, normalized_total);
+                    metrics.record_role(role, normalized_total, normalized_stats.code_lines);
                     pending.push((role, normalized_stats));
 
                     if args.verbose {
@@ -3268,16 +3281,28 @@ fn run_cli_with_metrics(args: Args, metrics: &mut PerformanceMetrics) -> io::Res
 
     if (args.role_breakdown || args.verbose) && metrics.has_role_data() {
         println!("\n{}", "Role Summary:".blue().bold());
-        for (idx, (files, lines)) in metrics.role_counters().iter().enumerate() {
+        for (idx, (files, lines, code_lines)) in metrics.role_counters().iter().enumerate() {
             let role = CodeRole::ALL[idx];
             println!(
-                "{}: {} file occurrences, {} lines",
+                "{}: {} file occurrences, {} code lines of {} total",
                 role.label().bright_cyan(),
                 format_number(*files).bright_yellow(),
+                format_number(*code_lines).bright_yellow(),
                 format_number(*lines).bright_yellow()
             );
         }
-        if files_processed < metrics.role_counters().iter().map(|(f, _)| f).sum::<u64>() {
+        let counters = metrics.role_counters();
+        let mainline_code = counters[CodeRole::Mainline.as_index()].2;
+        let test_code = counters[CodeRole::Test.as_index()].2;
+        if mainline_code > 0 && test_code > 0 {
+            let gcd = gcd(test_code, mainline_code);
+            println!(
+                "Test:Mainline code ratio of {}:{}",
+                format_number(test_code / gcd).bright_yellow(),
+                format_number(mainline_code / gcd).bright_yellow()
+            );
+        }
+        if files_processed < counters.iter().map(|(f, _, _)| f).sum::<u64>() {
             println!(
                 "{}",
                 "(Note: files can appear in multiple roles; counts above are per-role occurrences.)"

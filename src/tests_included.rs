@@ -126,9 +126,10 @@
             0,
             "lines counter should start at zero"
         );
-        for (files, lines) in metrics.role_counters() {
+        for (files, lines, code_lines) in metrics.role_counters() {
             assert_eq!(files, 0, "role files should start at zero");
             assert_eq!(lines, 0, "role lines should start at zero");
+            assert_eq!(code_lines, 0, "role code lines should start at zero");
         }
         metrics.update(7);
         assert_eq!(
@@ -141,7 +142,7 @@
             7,
             "line counter should accumulate after update"
         );
-        metrics.record_role(CodeRole::Test, 5);
+        metrics.record_role(CodeRole::Test, 5, 3);
         let counters = metrics.role_counters();
         assert_eq!(
             counters[CodeRole::Test.as_index()].0,
@@ -152,6 +153,11 @@
             counters[CodeRole::Test.as_index()].1,
             5,
             "test role line counter should record increments"
+        );
+        assert_eq!(
+            counters[CodeRole::Test.as_index()].2,
+            3,
+            "test role code line counter should record increments"
         );
     }
 
