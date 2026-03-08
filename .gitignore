@@ -4,3 +4,4 @@ obj/
 *.tmp
 *.log
 tmp-review/
+.claude/
