@@ -1039,15 +1039,6 @@ fn safe_rate(value: u64, elapsed_secs: f64) -> f64 {
     }
 }
 
-fn gcd(mut a: u64, mut b: u64) -> u64 {
-    while b != 0 {
-        let t = b;
-        b = a % b;
-        a = t;
-    }
-    a
-}
-
 fn safe_percentage(numerator: u64, denominator: u64) -> f64 {
     if denominator == 0 {
         0.0
@@ -3295,11 +3286,13 @@ fn run_cli_with_metrics(args: Args, metrics: &mut PerformanceMetrics) -> io::Res
         let mainline_code = counters[CodeRole::Mainline.as_index()].2;
         let test_code = counters[CodeRole::Test.as_index()].2;
         if mainline_code > 0 && test_code > 0 {
-            let gcd = gcd(test_code, mainline_code);
+            let smaller = mainline_code.min(test_code) as f64;
+            let test_ratio = (test_code as f64 / smaller).round() as u64;
+            let main_ratio = (mainline_code as f64 / smaller).round() as u64;
             println!(
                 "Test:Mainline code ratio of {}:{}",
-                format_number(test_code / gcd).bright_yellow(),
-                format_number(mainline_code / gcd).bright_yellow()
+                format_number(test_ratio).bright_yellow(),
+                format_number(main_ratio).bright_yellow()
             );
         }
         if files_processed < counters.iter().map(|(f, _, _)| f).sum::<u64>() {
